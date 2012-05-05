@@ -46,8 +46,8 @@ __launch_bounds__ (KernelPolicy::THREADS, KernelPolicy::MIN_CTA_OCCUPANCY)
 __global__
 void Kernel(
 	SizeT 		*d_spine,
-	KeyType 	*d_in_keys,
-	KeyType 	*d_out_keys,
+	KeyType 	*d_keys0,
+	KeyType 	*d_keys1,
 	util::CtaWorkDistribution<SizeT> work_decomposition)
 {
 
@@ -57,18 +57,13 @@ void Kernel(
 	// Shared memory pool
 	__shared__ typename Cta::SmemStorage smem_storage;
 	
-	// Determine where to read our input
-	KeyType *d_keys = (KernelPolicy::CURRENT_PASS & 0x1) ?
-		d_out_keys :
-		d_in_keys;
-
 	// Determine our threadblock's work range
 	util::CtaWorkLimits<SizeT> work_limits;
 	work_decomposition.GetCtaWorkLimits(
 		work_limits,
 		KernelPolicy::LOG_TILE_ELEMENTS);
 
-	Cta cta(smem_storage, d_keys, d_spine);
+	Cta cta(smem_storage, d_spine, d_keys0, d_keys1);
 	cta.ProcessWorkRange(work_limits);
 }
 

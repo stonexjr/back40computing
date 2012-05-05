@@ -28,7 +28,6 @@
 #include <b40c/util/basic_utils.cuh>
 #include <b40c/util/device_intrinsics.cuh>
 #include <b40c/util/io/load_tile.cuh>
-#include <b40c/util/io/scatter_tile.cuh>
 #include <b40c/util/reduction/serial_reduce.cuh>
 
 #include <b40c/radix_sort/sort_utils.cuh>
@@ -47,16 +46,26 @@ template <
 struct Cta
 {
 	//---------------------------------------------------------------------
-	// Typedefs and Constants
+	// Type definitions and constants
 	//---------------------------------------------------------------------
 
+	// Integer type for digit counters (to be packed into words of PackedCounters)
+	typedef unsigned char DigitCounter;
+
+	// Integer type for packing DigitCounters into columns of shared memory banks
+	typedef typename util::If<
+		(KernelPolicy::SMEM_8BYTE_BANKS),
+		unsigned long long,
+		unsigned int>::Type PackedCounter;
+
 	enum {
-		MIN_CTA_OCCUPANCY  				= KernelPolicy::MIN_CTA_OCCUPANCY,
 		CURRENT_BIT 					= KernelPolicy::CURRENT_BIT,
 		CURRENT_PASS 					= KernelPolicy::CURRENT_PASS,
-
 		RADIX_BITS						= KernelPolicy::RADIX_BITS,
 		RADIX_DIGITS 					= 1 << RADIX_BITS,
+
+		// Direction of flow though ping-pong buffers: (FLOP_TURN) ? (d_keys1 --> d_keys0) : (d_keys0 --> d_keys1)
+		FLOP_TURN						= KernelPolicy::CURRENT_PASS & 0x1,
 
 		LOG_THREADS 					= KernelPolicy::LOG_THREADS,
 		THREADS							= 1 << LOG_THREADS,
@@ -73,47 +82,31 @@ struct Cta
 		LOG_LOADS_PER_TILE 				= KernelPolicy::LOG_LOADS_PER_TILE,
 		LOADS_PER_TILE					= 1 << LOG_LOADS_PER_TILE,
 
-
 		LOG_TILE_ELEMENTS_PER_THREAD	= LOG_LOAD_VEC_SIZE + LOG_LOADS_PER_TILE,
 		TILE_ELEMENTS_PER_THREAD		= 1 << LOG_TILE_ELEMENTS_PER_THREAD,
 
 		LOG_TILE_ELEMENTS 				= LOG_TILE_ELEMENTS_PER_THREAD + LOG_THREADS,
 		TILE_ELEMENTS					= 1 << LOG_TILE_ELEMENTS,
 
-
-		// A shared-memory composite counter lane is a row of 32-bit words, one word per thread, each word a
-		// composite of four 8-bit bin counters.  I.e., we need one lane for every four distribution bins.
-
-		BYTES_PER_COUNTER				= sizeof(char),
+		BYTES_PER_COUNTER				= sizeof(DigitCounter),
 		LOG_BYTES_PER_COUNTER			= util::Log2<BYTES_PER_COUNTER>::VALUE,
 
-		PACKED_COUNTERS					= sizeof(int) / sizeof(char),
-		LOG_PACKED_COUNTERS 			= util::Log2<PACKED_COUNTERS>::VALUE,
+		PACKING_RATIO					= sizeof(PackedCounter) / sizeof(DigitCounter),
+		LOG_PACKING_RATIO				= util::Log2<PACKING_RATIO>::VALUE,
 
-		LOG_COMPOSITE_LANES 			= CUB_MAX(0, RADIX_BITS - LOG_PACKED_COUNTERS),
-		COMPOSITE_LANES 				= 1 << LOG_COMPOSITE_LANES,
+		LOG_COUNTER_LANES 				= CUB_MAX(0, RADIX_BITS - LOG_PACKING_RATIO),
+		COUNTER_LANES 					= 1 << LOG_COUNTER_LANES,
 
-		LOG_COMPOSITES_PER_LANE			= LOG_THREADS,				// Every thread contributes one partial for each lane
-		COMPOSITES_PER_LANE 			= 1 << LOG_COMPOSITES_PER_LANE,
+		// To prevent counter overflow, we must periodically unpack and aggregate the
+		// digit counters back into registers.  Each counter lane is assigned to a
+		// warp for aggregation.
 
-		// To prevent bin-counter overflow, we must partially-aggregate the
-		// 8-bit composite counters back into SizeT-bit registers periodically.  Each lane
-		// is assigned to a warp for aggregation.  Each lane is therefore equivalent to
-		// four rows of SizeT-bit bin-counts, each the width of a warp.
-
-		LOG_LANES_PER_WARP					= CUB_MAX(0, LOG_COMPOSITE_LANES - LOG_WARPS),
+		LOG_LANES_PER_WARP					= CUB_MAX(0, LOG_COUNTER_LANES - LOG_WARPS),
 		LANES_PER_WARP 						= 1 << LOG_LANES_PER_WARP,
 
-		LOG_COMPOSITES_PER_LANE_PER_THREAD 	= LOG_COMPOSITES_PER_LANE - LOG_WARP_THREADS,		// Number of partials per thread to aggregate
-		COMPOSITES_PER_LANE_PER_THREAD 		= 1 << LOG_COMPOSITES_PER_LANE_PER_THREAD,
-
-		AGGREGATED_ROWS						= RADIX_DIGITS,
-		AGGREGATED_PARTIALS_PER_ROW 		= WARP_THREADS,
-		PADDED_AGGREGATED_PARTIALS_PER_ROW 	= AGGREGATED_PARTIALS_PER_ROW + 1,
-
-		// Unroll tiles in batches of X elements per thread (X = log(255) is maximum without risking overflow)
-		LOG_UNROLL_COUNT 					= 6 - LOG_TILE_ELEMENTS_PER_THREAD,		// X = 128
-		UNROLL_COUNT						= 1 << LOG_UNROLL_COUNT,
+		// Unroll tiles in batches without risk of counter overflow
+		UNROLL_COUNT						= 127 / TILE_ELEMENTS_PER_THREAD,
+		UNROLLED_ELEMENTS 					= UNROLL_COUNT * TILE_ELEMENTS,
 	};
 
 
@@ -124,162 +117,73 @@ struct Cta
 	struct SmemStorage
 	{
 		union {
-			// Composite counter storage
-			union {
-				char counters[COMPOSITE_LANES][THREADS][4];
-				int words[COMPOSITE_LANES][THREADS];
-				int direct[COMPOSITE_LANES * THREADS];
-			};
-
-			// Final bin reduction storage
-			SizeT aggregate[AGGREGATED_ROWS][PADDED_AGGREGATED_PARTIALS_PER_ROW];
+			unsigned char	counter_base[1];
+			DigitCounter 	digit_counters[COUNTER_LANES][THREADS][PACKING_RATIO];
+			PackedCounter 	packed_counters[COUNTER_LANES][THREADS];
+			SizeT 			digit_partials[RADIX_DIGITS][WARP_THREADS + 1];
 		};
 	};
 
+
 	//---------------------------------------------------------------------
-	// Fields
+	// Thread fields
 	//---------------------------------------------------------------------
 
 	// Shared storage for this CTA
 	SmemStorage 	&smem_storage;
 
 	// Thread-local counters for periodically aggregating composite-counter lanes
-	SizeT 			local_counts[LANES_PER_WARP][4];
+	SizeT 			local_counts[LANES_PER_WARP][PACKING_RATIO];
 
 	// Input and output device pointers
 	KeyType			*d_in_keys;
 	SizeT			*d_spine;
 
 	int 			warp_id;
-	int 			warp_idx;
+	int 			warp_tid;
 
-	char 			*base;
+	DigitCounter	*base_counter;
 
 
 	//---------------------------------------------------------------------
-	// Helper structure for counter aggregation
+	// Helper structure for templated iteration
 	//---------------------------------------------------------------------
 
-	/**
-	 * Iterate next composite counter
-	 */
-	template <int WARP_LANE, int THREAD_COMPOSITE, int dummy = 0>
+	// Iterate
+	template <int COUNT, int MAX>
 	struct Iterate
 	{
-		// ExtractComposites
-		static __device__ __forceinline__ void ExtractComposites(Cta &cta)
+		// BucketKeys
+		static __device__ __forceinline__ void BucketKeys(
+			Cta &cta,
+			KeyType keys[TILE_ELEMENTS_PER_THREAD])
 		{
-			const int LANE_OFFSET = WARP_LANE * WARPS * THREADS * 4;
-			const int COMPOSITE_OFFSET = THREAD_COMPOSITE * CUB_WARP_THREADS(__CUB_CUDA_ARCH__) * 4;
+			cta.Bucket(keys[COUNT]);
 
-			cta.local_counts[WARP_LANE][0] += *(cta.base + LANE_OFFSET + COMPOSITE_OFFSET + 0);
-			cta.local_counts[WARP_LANE][1] += *(cta.base + LANE_OFFSET + COMPOSITE_OFFSET + 1);
-			cta.local_counts[WARP_LANE][2] += *(cta.base + LANE_OFFSET + COMPOSITE_OFFSET + 2);
-			cta.local_counts[WARP_LANE][3] += *(cta.base + LANE_OFFSET + COMPOSITE_OFFSET + 3);
+			// Next
+			Iterate<COUNT + 1, MAX>::BucketKeys(cta, keys);
+		}
 
-			Iterate<WARP_LANE, THREAD_COMPOSITE + 1>::ExtractComposites(cta);
+		// ProcessTiles
+		static __device__ __forceinline__ void ProcessTiles(Cta &cta, SizeT cta_offset)
+		{
+			cta.ProcessFullTile(cta_offset);
+
+			// Next
+			Iterate<COUNT + 1, MAX>::ProcessTiles(cta, cta_offset + TILE_ELEMENTS);
 		}
 	};
 
-	/**
-	 * Iterate next lane
-	 */
-	template <int WARP_LANE, int dummy>
-	struct Iterate<WARP_LANE, COMPOSITES_PER_LANE_PER_THREAD, dummy>
+	// Terminate
+	template <int MAX>
+	struct Iterate<MAX, MAX>
 	{
-		// ExtractComposites
-		static __device__ __forceinline__ void ExtractComposites(Cta &cta)
-		{
-			Iterate<WARP_LANE + 1, 0>::ExtractComposites(cta);
-		}
+		// BucketKeys
+		static __device__ __forceinline__ void BucketKeys(Cta &cta, KeyType keys[TILE_ELEMENTS_PER_THREAD]) {}
 
-		// ShareCounters
-		static __device__ __forceinline__ void ShareCounters(Cta &cta)
-		{
-			int lane				= (WARP_LANE * WARPS) + cta.warp_id;
-			int row 				= lane << 2;	// lane * 4;
-
-			cta.smem_storage.aggregate[row + 0][cta.warp_idx] = cta.local_counts[WARP_LANE][0];
-			cta.smem_storage.aggregate[row + 1][cta.warp_idx] = cta.local_counts[WARP_LANE][1];
-			cta.smem_storage.aggregate[row + 2][cta.warp_idx] = cta.local_counts[WARP_LANE][2];
-			cta.smem_storage.aggregate[row + 3][cta.warp_idx] = cta.local_counts[WARP_LANE][3];
-
-			Iterate<WARP_LANE + 1, COMPOSITES_PER_LANE_PER_THREAD>::ShareCounters(cta);
-		}
-
-		// ResetCounters
-		static __device__ __forceinline__ void ResetCounters(Cta &cta)
-		{
-			cta.local_counts[WARP_LANE][0] = 0;
-			cta.local_counts[WARP_LANE][1] = 0;
-			cta.local_counts[WARP_LANE][2] = 0;
-			cta.local_counts[WARP_LANE][3] = 0;
-
-			Iterate<WARP_LANE + 1, COMPOSITES_PER_LANE_PER_THREAD>::ResetCounters(cta);
-		}
+		// ProcessTiles
+		static __device__ __forceinline__ void ProcessTiles(Cta &cta, SizeT cta_offset) {}
 	};
-
-	/**
-	 * Terminate iteration
-	 */
-	template <int dummy>
-	struct Iterate<LANES_PER_WARP, 0, dummy>
-	{
-		// ExtractComposites
-		static __device__ __forceinline__ void ExtractComposites(Cta &cta) {}
-	};
-
-	/**
-	 * Terminate iteration
-	 */
-	template <int dummy>
-	struct Iterate<LANES_PER_WARP, COMPOSITES_PER_LANE_PER_THREAD, dummy>
-	{
-		// ShareCounters
-		static __device__ __forceinline__ void ShareCounters(Cta &cta) {}
-
-		// ResetCounters
-		static __device__ __forceinline__ void ResetCounters(Cta &cta) {}
-	};
-
-
-	//---------------------------------------------------------------------
-	// Helper structure for tile unrolling
-	//---------------------------------------------------------------------
-
-	/**
-	 * Unrolled tile processing
-	 */
-	struct UnrollTiles
-	{
-		// Recurse over counts
-		template <int UNROLL_COUNT, int __dummy = 0>
-		struct Iterate
-		{
-			static const int HALF = UNROLL_COUNT / 2;
-
-			static __device__ __forceinline__ void ProcessTiles(
-				Cta &cta, SizeT cta_offset)
-			{
-				Iterate<HALF>::ProcessTiles(cta, cta_offset);
-				Iterate<HALF>::ProcessTiles(cta, cta_offset + (TILE_ELEMENTS * HALF));
-			}
-		};
-
-		// Terminate (process one tile)
-		template <int __dummy>
-		struct Iterate<1, __dummy>
-		{
-			static __device__ __forceinline__ void ProcessTiles(
-				Cta &cta, SizeT cta_offset)
-			{
-				cta.ProcessFullTile(cta_offset);
-			}
-		};
-	};
-
-
-
 
 
 	//---------------------------------------------------------------------
@@ -291,110 +195,145 @@ struct Cta
 	 */
 	__device__ __forceinline__ Cta(
 		SmemStorage 	&smem_storage,
-		KeyType 		*d_in_keys,
-		SizeT 			*d_spine) :
+		SizeT 			*d_spine,
+		KeyType 		*d_keys0,
+		KeyType 		*d_keys1) :
 			smem_storage(smem_storage),
-			d_in_keys(d_in_keys),
+			d_in_keys(FLOP_TURN ? d_keys1 : d_keys0),
 			d_spine(d_spine),
 			warp_id(threadIdx.x >> LOG_WARP_THREADS),
-			warp_idx(util::LaneId())
+			warp_tid(util::LaneId())
 	{
-		base = (char *) (smem_storage.words[warp_id] + warp_idx);
+		base_counter = smem_storage.digit_counters[warp_id][warp_tid];
 	}
 
 
 	/**
-	 * Bucket a key into smem counters
+	 * Decode a key and increment corresponding smem digit counter
 	 */
 	__device__ __forceinline__ void Bucket(KeyType key)
 	{
 		// Compute byte offset of smem counter.  Add in thread column.
-		unsigned int offset = (threadIdx.x << (LOG_PACKED_COUNTERS + LOG_BYTES_PER_COUNTER));
+		unsigned int byte_offset = (threadIdx.x << (LOG_PACKING_RATIO + LOG_BYTES_PER_COUNTER));
 
-		// Add in sub-counter offset
-		offset = Extract<
+		// Add in sub-counter byte_offset
+		byte_offset = Extract<
 			KeyType,
 			CURRENT_BIT,
-			LOG_PACKED_COUNTERS,
+			LOG_PACKING_RATIO,
 			LOG_BYTES_PER_COUNTER>::SuperBFE(
 				key,
-				offset);
+				byte_offset);
 
-		// Add in row offset
-		offset = Extract<
+		// Add in row byte_offset
+		byte_offset = Extract<
 			KeyType,
-			CURRENT_BIT + LOG_PACKED_COUNTERS,
-			LOG_COMPOSITE_LANES,
-			LOG_THREADS + (LOG_PACKED_COUNTERS + LOG_BYTES_PER_COUNTER)>::SuperBFE(
+			CURRENT_BIT + LOG_PACKING_RATIO,
+			LOG_COUNTER_LANES,
+			LOG_THREADS + (LOG_PACKING_RATIO + LOG_BYTES_PER_COUNTER)>::SuperBFE(
 				key,
-				offset);
+				byte_offset);
 
-		((unsigned char *) smem_storage.counters)[offset]++;
-
-
+		// Increment counter
+		DigitCounter *counter = (DigitCounter*) (smem_storage.counter_base + byte_offset);
+		(*counter)++;
 	}
-
-
-	template <int COUNT, int MAX>
-	struct IterateKeys
-	{
-		static __device__ __forceinline__ void Bucket(
-			Cta &cta, KeyType keys[LOADS_PER_TILE * LOAD_VEC_SIZE])
-		{
-			cta.Bucket(keys[COUNT]);
-			IterateKeys<COUNT + 1, MAX>::Bucket(cta, keys);
-		}
-	};
-
-
-	template <int MAX>
-	struct IterateKeys<MAX, MAX>
-	{
-		static __device__ __forceinline__ void Bucket(
-			Cta &cta, KeyType keys[LOADS_PER_TILE * LOAD_VEC_SIZE]) {}
-	};
 
 
 	/**
 	 * Reset composite counters
 	 */
-	__device__ __forceinline__ void ResetCompositeCounters()
+	__device__ __forceinline__ void ResetDigitCounters()
 	{
 		#pragma unroll
-		for (int LANE = 0; LANE < COMPOSITE_LANES; ++LANE) {
-			smem_storage.words[LANE][threadIdx.x] = 0;
+		for (int LANE = 0; LANE < COUNTER_LANES; LANE++)
+		{
+			smem_storage.packed_counters[LANE][threadIdx.x] = 0;
 		}
 	}
 
 
 	/**
-	 * Resets the aggregate counters
+	 * Reset the unpacked counters in each thread
 	 */
-	__device__ __forceinline__ void ResetCounters()
+	__device__ __forceinline__ void ResetUnpackedCounters()
 	{
-		Iterate<0, COMPOSITES_PER_LANE_PER_THREAD>::ResetCounters(*this);
-	}
-
-
-	/**
-	 * Extracts and aggregates the shared-memory composite counters for each
-	 * composite-counter lane owned by this warp
-	 */
-	__device__ __forceinline__ void ExtractComposites()
-	{
-		if (warp_id < COMPOSITE_LANES) {
-			Iterate<0, 0>::ExtractComposites(*this);
+		#pragma unroll
+		for (int LANE = 0; LANE < LANES_PER_WARP; LANE++)
+		{
+			#pragma unroll
+			for (int UNPACKED_COUNTER = 0; UNPACKED_COUNTER < PACKING_RATIO; UNPACKED_COUNTER++)
+			{
+				local_counts[LANE][UNPACKED_COUNTER] = 0;
+			}
 		}
 	}
 
 
 	/**
-	 * Places aggregate-counters into shared storage for final bin-wise reduction
+	 * Extracts and aggregates the digit counters for each counter lane
+	 * owned by this warp
 	 */
-	__device__ __forceinline__ void ShareCounters()
+	__device__ __forceinline__ void UnpackDigitCounts()
 	{
-		if (warp_id < COMPOSITE_LANES) {
-			Iterate<0, COMPOSITES_PER_LANE_PER_THREAD>::ShareCounters(*this);
+		if (warp_id < COUNTER_LANES)
+		{
+			#pragma unroll
+			for (int LANE = 0; LANE < LANES_PER_WARP; LANE++)
+			{
+				const int COUNTER_LANE = LANE * WARPS;
+
+				#pragma unroll
+				for (int PACKED_COUNTER = 0; PACKED_COUNTER < THREADS; PACKED_COUNTER += WARP_THREADS)
+				{
+					#pragma unroll
+					for (int UNPACKED_COUNTER = 0; UNPACKED_COUNTER < PACKING_RATIO; UNPACKED_COUNTER++)
+					{
+						const int OFFSET = (((COUNTER_LANE * THREADS) + PACKED_COUNTER) * PACKING_RATIO) + UNPACKED_COUNTER;
+						local_counts[LANE][UNPACKED_COUNTER] += *(base_counter + OFFSET);
+					}
+				}
+			}
+		}
+	}
+
+
+	/**
+	 * Places unpacked counters into smem for final digit reduction
+	 */
+	__device__ __forceinline__ void ReduceUnpackedCounts()
+	{
+		// Place unpacked digit counters in shared memory
+		if (warp_id < COUNTER_LANES)
+		{
+			#pragma unroll
+			for (int LANE = 0; LANE < LANES_PER_WARP; LANE++)
+			{
+				const int COUNTER_LANE = LANE * WARPS;
+				int digit_row = (COUNTER_LANE + warp_id) << LOG_PACKING_RATIO;
+
+				#pragma unroll
+				for (int UNPACKED_COUNTER = 0; UNPACKED_COUNTER < PACKING_RATIO; UNPACKED_COUNTER++)
+				{
+					smem_storage.digit_partials[digit_row + UNPACKED_COUNTER][warp_tid]
+						  = local_counts[LANE][UNPACKED_COUNTER];
+				}
+			}
+		}
+
+		__syncthreads();
+
+		// Rake-reduce and write out the bin_count reductions
+		if (threadIdx.x < RADIX_DIGITS)
+		{
+			SizeT bin_count = util::reduction::SerialReduce<WARP_THREADS>::Invoke(
+				smem_storage.digit_partials[threadIdx.x]);
+
+			int spine_bin_offset = (gridDim.x * threadIdx.x) + blockIdx.x;
+
+			util::io::ModifiedStore<KernelPolicy::WRITE_MODIFIER>::St(
+				bin_count,
+				d_spine + spine_bin_offset);
 		}
 	}
 
@@ -422,9 +361,7 @@ struct Cta
 		if (LOADS_PER_TILE > 1) __syncthreads();
 
 		// Bucket tile of keys
-		IterateKeys<0, LOADS_PER_TILE * LOAD_VEC_SIZE>::Bucket(
-			*this,
-			(KeyType *) keys);
+		Iterate<0, TILE_ELEMENTS_PER_THREAD>::BucketKeys(*this, (KeyType*) keys);
 	}
 
 
@@ -437,8 +374,8 @@ struct Cta
 	{
 		// Process partial tile if necessary using single loads
 		cta_offset += threadIdx.x;
-		while (cta_offset < out_of_bounds) {
-
+		while (cta_offset < out_of_bounds)
+		{
 			// Load and bucket key
 			KeyType key = d_in_keys[cta_offset];
 			Bucket(key);
@@ -453,64 +390,35 @@ struct Cta
 	__device__ __forceinline__ void ProcessWorkRange(
 		util::CtaWorkLimits<SizeT> &work_limits)
 	{
-		// Make sure we get a local copy of the cta's offset (work_limits may be in smem)
+		// Reset digit counters in smem and unpacked counters in registers
+		ResetDigitCounters();
+		ResetUnpackedCounters();
+
 		SizeT cta_offset = work_limits.offset;
 
-		ResetCounters();
-		ResetCompositeCounters();
-
-
-#if 1	// Use deep unrolling for better instruction efficiency
-
 		// Unroll batches of full tiles
-		const int UNROLLED_ELEMENTS = UNROLL_COUNT * TILE_ELEMENTS;
-		while (cta_offset  + UNROLLED_ELEMENTS < work_limits.out_of_bounds) {
-
-			UnrollTiles::template Iterate<UNROLL_COUNT>::ProcessTiles(
-				*this,
-				cta_offset);
+		while (cta_offset + UNROLLED_ELEMENTS < work_limits.out_of_bounds)
+		{
+			Iterate<0, UNROLL_COUNT>::ProcessTiles(*this, cta_offset);
 			cta_offset += UNROLLED_ELEMENTS;
 
 			__syncthreads();
 
 			// Aggregate back into local_count registers to prevent overflow
-			ExtractComposites();
+			UnpackDigitCounts();
 
 			__syncthreads();
 
 			// Reset composite counters in lanes
-			ResetCompositeCounters();
+			ResetDigitCounters();
 		}
 
 		// Unroll single full tiles
-		while (cta_offset < work_limits.guarded_offset) {
+		while (cta_offset < work_limits.guarded_offset)
+		{
 			ProcessFullTile(cta_offset);
 			cta_offset += TILE_ELEMENTS;
 		}
-
-#else 	// Use shallow unrolling for faster compilation tiles
-
-		// Unroll single full tiles
-		while (cta_offset < work_limits.guarded_offset) {
-
-			ProcessFullTile(cta_offset);
-			cta_offset += TILE_ELEMENTS;
-
-			const SizeT UNROLL_MASK = (UNROLL_COUNT - 1) << LOG_TILE_ELEMENTS;
-			if ((cta_offset & UNROLL_MASK) == 0) {
-
-				__syncthreads();
-
-				// Aggregate back into local_count registers to prevent overflow
-				ExtractComposites();
-
-				__syncthreads();
-
-				// Reset composite counters in lanes
-				ResetCompositeCounters();
-			}
-		}
-#endif
 
 		// Process partial tile if necessary
 		ProcessPartialTile(cta_offset, work_limits.out_of_bounds);
@@ -518,30 +426,12 @@ struct Cta
 		__syncthreads();
 
 		// Aggregate back into local_count registers
-		ExtractComposites();
+		UnpackDigitCounts();
 
 		__syncthreads();
 
 		// Final raking reduction of counts by bin, output to spine.
-
-		ShareCounters();
-
-		__syncthreads();
-
-		// Rake-reduce and write out the bin_count reductions
-		if (threadIdx.x < RADIX_DIGITS) {
-
-			SizeT bin_count = util::reduction::SerialReduce<AGGREGATED_PARTIALS_PER_ROW>::Invoke(
-				smem_storage.aggregate[threadIdx.x]);
-
-			int spine_bin_offset = (gridDim.x * threadIdx.x) + blockIdx.x;
-
-			util::io::ModifiedStore<KernelPolicy::WRITE_MODIFIER>::St(
-				bin_count,
-				d_spine + spine_bin_offset);
-
-
-		}
+		ReduceUnpackedCounts();
 	}
 };
 
