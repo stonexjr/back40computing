@@ -208,7 +208,7 @@ struct Cta
 	//---------------------------------------------------------------------
 
 	/**
-	 * Iteration helper
+	 * Iterate
 	 */
 	template <int COUNT, int MAX>
 	struct Iterate
@@ -388,6 +388,48 @@ struct Cta
 			// Next scatter pass
 			Iterate<COUNT + 1, MAX>::AlignedScatterPass(cta, exchange, d_out, valid_elements);
 		}
+
+		// Truck along associated values
+		static __device__ __forceinline__ void TruckValues(
+			SizeT tex_offset,
+			const SizeT &guarded_elements,
+			Cta &cta,
+			Tile &tile)
+		{
+			// Load tile of values
+			cta.LoadValues(tex_offset, guarded_elements, tile);
+
+			__syncthreads();
+
+			// Scatter values shared
+			Iterate<0, THREAD_ELEMENTS>::ScatterRanked(cta, tile, tile.values);
+
+			__syncthreads();
+
+			// Gather values from shared memory and scatter to global
+			if (SCATTER_STRATEGY == SCATTER_WARP_TWO_PHASE)
+			{
+				// Use explicitly warp-aligned scattering of values from smem
+				Iterate<0, SCATTER_PASSES>::AlignedScatterPass(
+					cta,
+					cta.smem_storage.value_exchange,
+					cta.d_out_values,
+					guarded_elements);
+
+			} else {
+
+				// Gather values shared
+				Iterate<0, THREAD_ELEMENTS>::GatherShared(cta, tile, tile.values);
+
+				// Scatter to global
+				Iterate<0, THREAD_ELEMENTS>::ScatterGlobal(
+					cta,
+					tile,
+					tile.values,
+					cta.d_out_values,
+					guarded_elements);
+			}
+		}
 	};
 
 
@@ -421,6 +463,9 @@ struct Cta
 		// AlignedScatterPass
 		template <typename T>
 		static __device__ __forceinline__ void AlignedScatterPass(Cta &cta, T *exchange, T *d_out, const SizeT &valid_elements) {}
+
+		// TruckValues
+		static __device__ __forceinline__ void TruckValues(SizeT tex_offset, const SizeT &guarded_elements, Cta &cta, Tile &tile) {}
 	};
 
 
@@ -574,8 +619,8 @@ struct Cta
 		PackedCounter warpscan_totals = 0;
 
 		#pragma unroll
-		for (int WARP = 0; WARP < WARPS; WARP++) {
-
+		for (int WARP = 0; WARP < WARPS; WARP++)
+		{
 			// Add totals from all previous warpscans into our partial
 			PackedCounter warpscan_total = smem_storage.warpscan[WARP][(WARP_THREADS * 3 / 2) - 1];
 			if (warp_id == WARP) {
@@ -588,7 +633,8 @@ struct Cta
 
 		// Add lower totals from all warpscans into partial's upper
 		#pragma unroll
-		for (int PACKED = 1; PACKED < PACKING_RATIO; PACKED++) {
+		for (int PACKED = 1; PACKED < PACKING_RATIO; PACKED++)
+		{
 			partial += warpscan_totals << (16 * PACKED);
 		}
 
@@ -601,80 +647,14 @@ struct Cta
 
 
 	/**
-	 * Truck along associated values.  (Specialized for key-value passes.)
-	 */
-	template <bool IS_KEYS_ONLY, int DUMMY = 0>
-	struct TruckValues
-	{
-		static __device__ __forceinline__ void Invoke(
-			SizeT tex_offset,
-			const SizeT &guarded_elements,
-			Cta &cta,
-			Tile &tile)
-		{
-			// Load tile of values
-			cta.LoadValues(tex_offset, guarded_elements, tile);
-
-			__syncthreads();
-
-			// Scatter values shared
-			Iterate<0, THREAD_ELEMENTS>::ScatterRanked(cta, tile, tile.values);
-
-			__syncthreads();
-
-			// Gather values from shared memory and scatter to global
-			if (SCATTER_STRATEGY == SCATTER_WARP_TWO_PHASE) {
-
-				// Use explicitly warp-aligned scattering of values from smem
-				Iterate<0, SCATTER_PASSES>::AlignedScatterPass(
-					cta,
-					cta.smem_storage.value_exchange,
-					cta.d_out_values,
-					guarded_elements);
-
-			} else {
-
-				// Gather values shared
-				Iterate<0, THREAD_ELEMENTS>::GatherShared(cta, tile, tile.values);
-
-				// Scatter to global
-				Iterate<0, THREAD_ELEMENTS>::ScatterGlobal(
-					cta,
-					tile,
-					tile.values,
-					cta.d_out_values,
-					guarded_elements);
-			}
-		}
-	};
-
-
-	/**
-	 * Truck along associated values.  (Specialized for keys-only passes.)
-	 */
-	template <int DUMMY>
-	struct TruckValues<true, DUMMY>
-	{
-		static __device__ __forceinline__ void Invoke(
-			SizeT tex_offset,
-			const SizeT &guarded_elements,
-			Cta &cta,
-			Tile &tile)
-		{
-			// do nothing
-		}
-	};
-
-
-	/**
 	 * Gather keys from smem and scatter to global
 	 */
 	__device__ __forceinline__ void GatherScatterKeys(
 		Tile &tile,
 		const SizeT &guarded_elements)
 	{
-		if (SCATTER_STRATEGY == SCATTER_WARP_TWO_PHASE) {
-
+		if (SCATTER_STRATEGY == SCATTER_WARP_TWO_PHASE)
+		{
 			// Use explicitly warp-aligned scattering of keys from smem
 			Iterate<0, SCATTER_PASSES>::AlignedScatterPass(
 				*this,
@@ -707,7 +687,8 @@ struct Cta
 	__device__ __forceinline__ void ResetCounters()
 	{
 		#pragma unroll
-		for (int LANE = 0; LANE < COUNTER_LANES + 1; LANE++) {
+		for (int LANE = 0; LANE < COUNTER_LANES + 1; LANE++)
+		{
 			*((PackedCounter*) smem_storage.digit_counters[LANE][threadIdx.x]) = 0;
 		}
 	}
@@ -718,8 +699,8 @@ struct Cta
 	 */
 	__device__ __forceinline__ void UpdateDigitScatterOffsets()
 	{
-		if ((THREADS == RADIX_DIGITS) || (threadIdx.x < RADIX_DIGITS)) {
-
+		if ((THREADS == RADIX_DIGITS) || (threadIdx.x < RADIX_DIGITS))
+		{
 			DigitCounter bin_inclusive = bin_counter[THREADS * PACKING_RATIO];
 			smem_storage.warpscan[0][16 + threadIdx.x] = bin_inclusive;
 			PackedCounter bin_exclusive = smem_storage.warpscan[0][16 + threadIdx.x - 1];
@@ -776,7 +757,7 @@ struct Cta
 		GatherScatterKeys(tile, guarded_elements);
 
 		// Truck along values (if applicable)
-		TruckValues<KEYS_ONLY>::Invoke(tex_offset, guarded_elements, *this, tile);
+		Iterate<0, !KEYS_ONLY>::TruckValues(tex_offset, guarded_elements, *this, tile);
 	}
 
 
@@ -790,13 +771,15 @@ struct Cta
 		SizeT tex_offset = smem_storage.tex_offset;
 
 		// Process full tiles of tile_elements
-		while (tex_offset < smem_storage.tex_offset_limit) {
+		while (tex_offset < smem_storage.tex_offset_limit)
+		{
 			ProcessTile(tex_offset);
 			tex_offset += TILE_TEX_LOADS;
 		}
 
 		// Clean up last partial tile with guarded-io
-		if (work_limits.guarded_elements) {
+		if (work_limits.guarded_elements)
+		{
 			ProcessTile(tex_offset, work_limits.guarded_elements);
 		}
 	}
