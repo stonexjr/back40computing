@@ -122,8 +122,8 @@ struct Cta
 		TILE_TEX_LOADS				= THREADS * THREAD_TEX_LOADS,
 	};
 
-	static const util::io::ld::CacheModifier 	READ_MODIFIER 		= KernelPolicy::READ_MODIFIER;
-	static const util::io::st::CacheModifier 	WRITE_MODIFIER 		= KernelPolicy::WRITE_MODIFIER;
+	static const util::io::ld::CacheModifier 	LOAD_MODIFIER 		= KernelPolicy::LOAD_MODIFIER;
+	static const util::io::st::CacheModifier 	STORE_MODIFIER 		= KernelPolicy::STORE_MODIFIER;
 	static const ScatterStrategy 				SCATTER_STRATEGY 	= KernelPolicy::SCATTER_STRATEGY;
 
 	// Key texture type
@@ -341,7 +341,7 @@ struct Cta
 			if ((guarded_elements >= TILE_ELEMENTS) || (tile_element < guarded_elements)) {
 
 				T* scatter = d_out + threadIdx.x + (THREADS * COUNT) + tile.global_digit_base[COUNT];
-				util::io::ModifiedStore<WRITE_MODIFIER>::St(items[COUNT], scatter);
+				util::io::ModifiedStore<STORE_MODIFIER>::St(items[COUNT], scatter);
 			}
 
 			// Next vector element
@@ -539,7 +539,7 @@ struct Cta
 				0,									// log loads per tile
 				LOG_THREAD_ELEMENTS,
 				THREADS,
-				READ_MODIFIER,
+				LOAD_MODIFIER,
 				false>::LoadValid(
 					(KeyType (*)[THREAD_ELEMENTS]) tile.keys,
 					d_in_keys,
@@ -578,7 +578,7 @@ struct Cta
 				0,									// log loads per tile
 				LOG_THREAD_ELEMENTS,
 				THREADS,
-				READ_MODIFIER,
+				LOAD_MODIFIER,
 				false>::LoadValid(
 					(ValueType (*)[THREAD_ELEMENTS]) tile.values,
 					d_in_values,
