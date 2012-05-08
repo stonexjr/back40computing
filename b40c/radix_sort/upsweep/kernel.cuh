@@ -41,16 +41,17 @@ namespace upsweep {
 template <
 	typename KernelPolicy,
 	typename SizeT,
-	typename KeyType>
+	typename KeyType,
+	typename IngressOp>
 __launch_bounds__ (KernelPolicy::THREADS, KernelPolicy::MIN_CTA_OCCUPANCY)
 __global__
 void Kernel(
 	SizeT 		*d_spine,
 	KeyType 	*d_keys0,
 	KeyType 	*d_keys1,
+	IngressOp	ingress_op,
 	util::CtaWorkDistribution<SizeT> work_decomposition)
 {
-
 	// CTA abstraction type
 	typedef Cta<KernelPolicy, SizeT, KeyType> Cta;
 
