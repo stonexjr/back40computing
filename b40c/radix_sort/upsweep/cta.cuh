@@ -331,7 +331,7 @@ struct Cta
 
 			int spine_bin_offset = (gridDim.x * threadIdx.x) + blockIdx.x;
 
-			util::io::ModifiedStore<KernelPolicy::WRITE_MODIFIER>::St(
+			util::io::ModifiedStore<KernelPolicy::STORE_MODIFIER>::St(
 				bin_count,
 				d_spine + spine_bin_offset);
 		}
@@ -351,7 +351,7 @@ struct Cta
 			LOG_LOADS_PER_TILE,
 			LOG_LOAD_VEC_SIZE,
 			THREADS,
-			KernelPolicy::READ_MODIFIER,
+			KernelPolicy::LOAD_MODIFIER,
 			false>::LoadValid(
 				(KeyType (*)[LOAD_VEC_SIZE]) keys,
 				d_in_keys,
