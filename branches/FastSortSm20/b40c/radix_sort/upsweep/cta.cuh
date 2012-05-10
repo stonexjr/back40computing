@@ -49,6 +49,9 @@ struct Cta
 	// Type definitions and constants
 	//---------------------------------------------------------------------
 
+	typedef typename KeyTraits<KeyType>::IngressOp 			IngressOp;
+	typedef typename KeyTraits<KeyType>::ConvertedKeyType 	ConvertedKeyType;
+
 	// Integer type for digit counters (to be packed into words of PackedCounters)
 	typedef unsigned char DigitCounter;
 
@@ -59,54 +62,54 @@ struct Cta
 		unsigned int>::Type PackedCounter;
 
 	enum {
-		CURRENT_BIT 					= KernelPolicy::CURRENT_BIT,
-		CURRENT_PASS 					= KernelPolicy::CURRENT_PASS,
-		RADIX_BITS						= KernelPolicy::RADIX_BITS,
-		RADIX_DIGITS 					= 1 << RADIX_BITS,
+		CURRENT_BIT 				= KernelPolicy::CURRENT_BIT,
+		CURRENT_PASS 				= KernelPolicy::CURRENT_PASS,
+		RADIX_BITS					= KernelPolicy::RADIX_BITS,
+		RADIX_DIGITS 				= 1 << RADIX_BITS,
 
 		// Direction of flow though ping-pong buffers: (FLOP_TURN) ? (d_keys1 --> d_keys0) : (d_keys0 --> d_keys1)
-		FLOP_TURN						= KernelPolicy::CURRENT_PASS & 0x1,
+		FLOP_TURN					= KernelPolicy::CURRENT_PASS & 0x1,
 
-		LOG_THREADS 					= KernelPolicy::LOG_THREADS,
-		THREADS							= 1 << LOG_THREADS,
+		LOG_THREADS 				= KernelPolicy::LOG_THREADS,
+		THREADS						= 1 << LOG_THREADS,
 
-		LOG_WARP_THREADS 				= CUB_LOG_WARP_THREADS(__CUB_CUDA_ARCH__),
-		WARP_THREADS					= 1 << LOG_WARP_THREADS,
+		LOG_WARP_THREADS 			= CUB_LOG_WARP_THREADS(__CUB_CUDA_ARCH__),
+		WARP_THREADS				= 1 << LOG_WARP_THREADS,
 
-		LOG_WARPS						= LOG_THREADS - LOG_WARP_THREADS,
-		WARPS							= 1 << LOG_WARPS,
+		LOG_WARPS					= LOG_THREADS - LOG_WARP_THREADS,
+		WARPS						= 1 << LOG_WARPS,
 
-		LOG_LOAD_VEC_SIZE  				= KernelPolicy::LOG_LOAD_VEC_SIZE,
-		LOAD_VEC_SIZE					= 1 << LOG_LOAD_VEC_SIZE,
+		LOG_LOAD_VEC_SIZE  			= KernelPolicy::LOG_LOAD_VEC_SIZE,
+		LOAD_VEC_SIZE				= 1 << LOG_LOAD_VEC_SIZE,
 
-		LOG_LOADS_PER_TILE 				= KernelPolicy::LOG_LOADS_PER_TILE,
-		LOADS_PER_TILE					= 1 << LOG_LOADS_PER_TILE,
+		LOG_LOADS_PER_TILE 			= KernelPolicy::LOG_LOADS_PER_TILE,
+		LOADS_PER_TILE				= 1 << LOG_LOADS_PER_TILE,
 
-		LOG_TILE_ELEMENTS_PER_THREAD	= LOG_LOAD_VEC_SIZE + LOG_LOADS_PER_TILE,
-		TILE_ELEMENTS_PER_THREAD		= 1 << LOG_TILE_ELEMENTS_PER_THREAD,
+		LOG_THREAD_ELEMENTS			= LOG_LOAD_VEC_SIZE + LOG_LOADS_PER_TILE,
+		THREAD_ELEMENTS				= 1 << LOG_THREAD_ELEMENTS,
 
-		LOG_TILE_ELEMENTS 				= LOG_TILE_ELEMENTS_PER_THREAD + LOG_THREADS,
-		TILE_ELEMENTS					= 1 << LOG_TILE_ELEMENTS,
+		LOG_TILE_ELEMENTS 			= LOG_THREAD_ELEMENTS + LOG_THREADS,
+		TILE_ELEMENTS				= 1 << LOG_TILE_ELEMENTS,
 
-		BYTES_PER_COUNTER				= sizeof(DigitCounter),
-		LOG_BYTES_PER_COUNTER			= util::Log2<BYTES_PER_COUNTER>::VALUE,
+		BYTES_PER_COUNTER			= sizeof(DigitCounter),
+		LOG_BYTES_PER_COUNTER		= util::Log2<BYTES_PER_COUNTER>::VALUE,
 
-		PACKING_RATIO					= sizeof(PackedCounter) / sizeof(DigitCounter),
-		LOG_PACKING_RATIO				= util::Log2<PACKING_RATIO>::VALUE,
+		PACKING_RATIO				= sizeof(PackedCounter) / sizeof(DigitCounter),
+		LOG_PACKING_RATIO			= util::Log2<PACKING_RATIO>::VALUE,
 
-		LOG_COUNTER_LANES 				= CUB_MAX(0, RADIX_BITS - LOG_PACKING_RATIO),
-		COUNTER_LANES 					= 1 << LOG_COUNTER_LANES,
+		LOG_COUNTER_LANES 			= CUB_MAX(0, RADIX_BITS - LOG_PACKING_RATIO),
+		COUNTER_LANES 				= 1 << LOG_COUNTER_LANES,
 
 		// To prevent counter overflow, we must periodically unpack and aggregate the
 		// digit counters back into registers.  Each counter lane is assigned to a
 		// warp for aggregation.
 
-		LOG_LANES_PER_WARP					= CUB_MAX(0, LOG_COUNTER_LANES - LOG_WARPS),
-		LANES_PER_WARP 						= 1 << LOG_LANES_PER_WARP,
+		LOG_LANES_PER_WARP			= CUB_MAX(0, LOG_COUNTER_LANES - LOG_WARPS),
+		LANES_PER_WARP 				= 1 << LOG_LANES_PER_WARP,
 
 		// Unroll tiles in batches without risk of counter overflow
-		UNROLL_COUNT						= 127 / TILE_ELEMENTS_PER_THREAD,
-		UNROLLED_ELEMENTS 					= UNROLL_COUNT * TILE_ELEMENTS,
+		UNROLL_COUNT				= 127 / THREAD_ELEMENTS,
+		UNROLLED_ELEMENTS 			= UNROLL_COUNT * TILE_ELEMENTS,
 	};
 
 
@@ -130,19 +133,22 @@ struct Cta
 	//---------------------------------------------------------------------
 
 	// Shared storage for this CTA
-	SmemStorage 	&smem_storage;
+	SmemStorage 		&smem_storage;
 
 	// Thread-local counters for periodically aggregating composite-counter lanes
-	SizeT 			local_counts[LANES_PER_WARP][PACKING_RATIO];
+	SizeT 				local_counts[LANES_PER_WARP][PACKING_RATIO];
 
 	// Input and output device pointers
-	KeyType			*d_in_keys;
-	SizeT			*d_spine;
+	ConvertedKeyType	*d_in_keys;
+	SizeT				*d_spine;
 
-	int 			warp_id;
-	int 			warp_tid;
+	// Bit-twiddling operator needed to make keys suitable for radix sorting
+	IngressOp			ingress_op;
 
-	DigitCounter	*base_counter;
+	int 				warp_id;
+	int 				warp_tid;
+
+	DigitCounter		*base_counter;
 
 
 	//---------------------------------------------------------------------
@@ -156,7 +162,7 @@ struct Cta
 		// BucketKeys
 		static __device__ __forceinline__ void BucketKeys(
 			Cta &cta,
-			KeyType keys[TILE_ELEMENTS_PER_THREAD])
+			ConvertedKeyType keys[THREAD_ELEMENTS])
 		{
 			cta.Bucket(keys[COUNT]);
 
@@ -179,7 +185,7 @@ struct Cta
 	struct Iterate<MAX, MAX>
 	{
 		// BucketKeys
-		static __device__ __forceinline__ void BucketKeys(Cta &cta, KeyType keys[TILE_ELEMENTS_PER_THREAD]) {}
+		static __device__ __forceinline__ void BucketKeys(Cta &cta, ConvertedKeyType keys[THREAD_ELEMENTS]) {}
 
 		// ProcessTiles
 		static __device__ __forceinline__ void ProcessTiles(Cta &cta, SizeT cta_offset) {}
@@ -199,7 +205,7 @@ struct Cta
 		KeyType 		*d_keys0,
 		KeyType 		*d_keys1) :
 			smem_storage(smem_storage),
-			d_in_keys(FLOP_TURN ? d_keys1 : d_keys0),
+			d_in_keys(reinterpret_cast<ConvertedKeyType*>(FLOP_TURN ? d_keys1 : d_keys0)),
 			d_spine(d_spine),
 			warp_id(threadIdx.x >> LOG_WARP_THREADS),
 			warp_tid(util::LaneId())
@@ -211,27 +217,28 @@ struct Cta
 	/**
 	 * Decode a key and increment corresponding smem digit counter
 	 */
-	__device__ __forceinline__ void Bucket(KeyType key)
+	__device__ __forceinline__ void Bucket(ConvertedKeyType key)
 	{
 		// Compute byte offset of smem counter.  Add in thread column.
 		unsigned int byte_offset = (threadIdx.x << (LOG_PACKING_RATIO + LOG_BYTES_PER_COUNTER));
 
+		// Perform transform op
+		ConvertedKeyType converted_key = ingress_op(key);
+
 		// Add in sub-counter byte_offset
 		byte_offset = Extract<
-			KeyType,
 			CURRENT_BIT,
 			LOG_PACKING_RATIO,
-			LOG_BYTES_PER_COUNTER>::SuperBFE(
-				key,
+			LOG_BYTES_PER_COUNTER>(
+				converted_key,
 				byte_offset);
 
 		// Add in row byte_offset
 		byte_offset = Extract<
-			KeyType,
 			CURRENT_BIT + LOG_PACKING_RATIO,
 			LOG_COUNTER_LANES,
-			LOG_THREADS + (LOG_PACKING_RATIO + LOG_BYTES_PER_COUNTER)>::SuperBFE(
-				key,
+			LOG_THREADS + (LOG_PACKING_RATIO + LOG_BYTES_PER_COUNTER)>(
+				converted_key,
 				byte_offset);
 
 		// Increment counter
@@ -344,7 +351,7 @@ struct Cta
 	__device__ __forceinline__ void ProcessFullTile(SizeT cta_offset)
 	{
 		// Tile of keys
-		KeyType keys[LOADS_PER_TILE][LOAD_VEC_SIZE];
+		ConvertedKeyType keys[LOADS_PER_TILE][LOAD_VEC_SIZE];
 
 		// Read tile of keys
 		util::io::LoadTile<
@@ -353,7 +360,7 @@ struct Cta
 			THREADS,
 			KernelPolicy::LOAD_MODIFIER,
 			false>::LoadValid(
-				(KeyType (*)[LOAD_VEC_SIZE]) keys,
+				(ConvertedKeyType (*)[LOAD_VEC_SIZE]) keys,
 				d_in_keys,
 				cta_offset);
 
@@ -361,7 +368,7 @@ struct Cta
 		if (LOADS_PER_TILE > 1) __syncthreads();
 
 		// Bucket tile of keys
-		Iterate<0, TILE_ELEMENTS_PER_THREAD>::BucketKeys(*this, (KeyType*) keys);
+		Iterate<0, THREAD_ELEMENTS>::BucketKeys(*this, (ConvertedKeyType*) keys);
 	}
 
 
@@ -377,7 +384,7 @@ struct Cta
 		while (cta_offset < out_of_bounds)
 		{
 			// Load and bucket key
-			KeyType key = d_in_keys[cta_offset];
+			ConvertedKeyType key = d_in_keys[cta_offset];
 			Bucket(key);
 			cta_offset += THREADS;
 		}
