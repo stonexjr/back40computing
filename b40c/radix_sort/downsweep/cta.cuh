@@ -69,6 +69,10 @@ struct Cta
 		unsigned long long,
 		unsigned int>::Type PackedCounter;
 
+	static const util::io::ld::CacheModifier 	LOAD_MODIFIER 		= KernelPolicy::LOAD_MODIFIER;
+	static const util::io::st::CacheModifier 	STORE_MODIFIER 		= KernelPolicy::STORE_MODIFIER;
+	static const ScatterStrategy 				SCATTER_STRATEGY 	= KernelPolicy::SCATTER_STRATEGY;
+
 	enum {
 		CURRENT_BIT 				= KernelPolicy::CURRENT_BIT,
 		CURRENT_PASS 				= KernelPolicy::CURRENT_PASS,
@@ -80,7 +84,7 @@ struct Cta
 		FLOP_TURN					= KernelPolicy::CURRENT_PASS & 0x1,
 
 		// Whether or not to insert padding for exchanging keys
-		BANK_PADDING 				= 1,
+		BANK_PADDING 				= (SCATTER_STRATEGY != SCATTER_WARP_TWO_PHASE),		// Padding is worse than bank conflicts on GPUs that need two-phase scattering
 
 		LOG_THREADS 				= KernelPolicy::LOG_THREADS,
 		THREADS						= 1 << LOG_THREADS,
@@ -127,10 +131,6 @@ struct Cta
 
 		TILE_TEX_LOADS				= THREADS * THREAD_TEX_LOADS,
 	};
-
-	static const util::io::ld::CacheModifier 	LOAD_MODIFIER 		= KernelPolicy::LOAD_MODIFIER;
-	static const util::io::st::CacheModifier 	STORE_MODIFIER 		= KernelPolicy::STORE_MODIFIER;
-	static const ScatterStrategy 				SCATTER_STRATEGY 	= KernelPolicy::SCATTER_STRATEGY;
 
 	// Key texture type
 	typedef typename Textures<
@@ -303,14 +303,9 @@ struct Cta
 			Tile &tile,
 			T items[THREAD_ELEMENTS])
 		{
-			int gather_offset =
-				threadIdx.x +
-				(BANK_PADDING ?
-					(threadIdx.x >> LOG_MEM_BANKS) :
-					0) +
-				(BANK_PADDING ?
-					(COUNT * THREADS) + ((COUNT * THREADS) >> LOG_MEM_BANKS) :
-					(COUNT * THREADS));
+			int gather_offset = (BANK_PADDING) ?
+				util::SHR_ADD(threadIdx.x, LOG_MEM_BANKS, threadIdx.x) + (COUNT * THREADS) + ((COUNT * THREADS) >> LOG_MEM_BANKS) :
+				threadIdx.x + (COUNT * THREADS);
 
 			items[COUNT] = ((T*) cta.smem_storage.key_exchange)[gather_offset];
 
@@ -349,8 +344,8 @@ struct Cta
 			int tile_element = threadIdx.x + (COUNT * THREADS);
 
 			// Distribute if not out-of-bounds
-			if ((guarded_elements >= TILE_ELEMENTS) || (tile_element < guarded_elements)) {
-
+			if ((guarded_elements >= TILE_ELEMENTS) || (tile_element < guarded_elements))
+			{
 				T* scatter = d_out + threadIdx.x + (THREADS * COUNT) + tile.global_digit_base[COUNT];
 				util::io::ModifiedStore<STORE_MODIFIER>::St(items[COUNT], scatter);
 			}
@@ -376,8 +371,8 @@ struct Cta
 
 			int my_digit = (COUNT * DIGITS_PER_SCATTER_PASS) + store_txn_digit;
 
-			if (my_digit < RADIX_DIGITS) {
-
+			if (my_digit < RADIX_DIGITS)
+			{
 				int my_exclusive_scan = cta.smem_storage.warpscan[0][16 + my_digit - 1];
 				int my_inclusive_scan = cta.smem_storage.warpscan[0][16 + my_digit];
 				int my_digit_count = my_inclusive_scan - my_exclusive_scan;
@@ -385,9 +380,12 @@ struct Cta
 				int my_carry = cta.smem_storage.base_digit_offset[my_digit] + my_exclusive_scan;
 				int my_aligned_offset = store_txn_idx - (my_carry & (STORE_TXN_THREADS - 1));
 
-				while (my_aligned_offset < my_digit_count) {
-
-					if ((my_aligned_offset >= 0) && (my_exclusive_scan + my_aligned_offset < valid_elements)) {
+				while (my_aligned_offset < my_digit_count)
+				{
+					if ((my_aligned_offset >= 0) && (my_exclusive_scan + my_aligned_offset < valid_elements))
+					{
+						int gather_offset = my_exclusive_scan + my_aligned_offset;
+						if (BANK_PADDING) gather_offset = util::SHR_ADD(gather_offset, LOG_MEM_BANKS, gather_offset);
 
 						T datum = exchange[my_exclusive_scan + my_aligned_offset];
 						d_out[my_carry + my_aligned_offset] = datum;
@@ -426,9 +424,9 @@ struct Cta
 					cta.smem_storage.value_exchange,
 					cta.d_out_values,
 					guarded_elements);
-
-			} else {
-
+			}
+			else
+			{
 				// Gather values shared
 				Iterate<0, THREAD_ELEMENTS>::GatherShared(cta, tile, tile.values);
 
@@ -512,8 +510,8 @@ struct Cta
 		warpscan = &smem_storage.warpscan[warp_id][16 + (threadIdx.x & 31)];
 		warpscan[-16] = 0;
 
-		if ((THREADS == RADIX_DIGITS) || (threadIdx.x < RADIX_DIGITS)) {
-
+		if ((THREADS == RADIX_DIGITS) || (threadIdx.x < RADIX_DIGITS))
+		{
 			// Read base_digit_offset in parallel
 			int spine_bin_offset = (gridDim.x * threadIdx.x) + blockIdx.x;
 			global_digit_base = tex1Dfetch(spine::TexSpine<SizeT>::ref, spine_bin_offset);
@@ -529,22 +527,23 @@ struct Cta
 		const SizeT &guarded_elements,
 		Tile &tile)
 	{
-		if (guarded_elements >= TILE_ELEMENTS) {
-
+		if (guarded_elements >= TILE_ELEMENTS)
+		{
 			// Unguarded loads through tex
 			KeyTexType *vectors = (KeyTexType *) tile.keys;
 
 			#pragma unroll
-			for (int PACK = 0; PACK < THREAD_TEX_LOADS; PACK++) {
-
+			for (int PACK = 0; PACK < THREAD_TEX_LOADS; PACK++)
+			{
 				vectors[PACK] = tex1Dfetch(
 					(Cta::FLOP_TURN) ?
 						TexKeys<KeyTexType>::ref1 :
 						TexKeys<KeyTexType>::ref0,
 					tex_offset + (threadIdx.x * THREAD_TEX_LOADS) + PACK);
 			}
-		} else {
-
+		}
+		else
+		{
 			// Guarded loads with default assignment of -1 to out-of-bound keys
 			util::io::LoadTile<
 				0,									// log loads per tile
@@ -568,22 +567,24 @@ struct Cta
 		const SizeT &guarded_elements,
 		Tile &tile)
 	{
-		if (guarded_elements >= TILE_ELEMENTS) {
-
+		if ((util::NumericTraits<ValueType>::BUILT_IN) &&
+			(guarded_elements >= TILE_ELEMENTS))
+		{
 			// Unguarded loads through tex
 			ValueTexType *vectors = (ValueTexType*) tile.values;
 
 			#pragma unroll
-			for (int PACK = 0; PACK < THREAD_TEX_LOADS; PACK++) {
-
+			for (int PACK = 0; PACK < THREAD_TEX_LOADS; PACK++)
+			{
 				vectors[PACK] = tex1Dfetch(
 					(Cta::FLOP_TURN) ?
 						TexValues<ValueTexType>::ref1 :
 						TexValues<ValueTexType>::ref0,
 					tex_offset + (threadIdx.x * THREAD_TEX_LOADS) + PACK);
 			}
-
-		} else {
+		}
+		else
+		{
 			// Guarded loads with default assignment of -1 to out-of-bound values
 			util::io::LoadTile<
 				0,									// log loads per tile

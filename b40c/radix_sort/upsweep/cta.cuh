@@ -107,7 +107,7 @@ struct Cta
 		LANES_PER_WARP 				= 1 << LOG_LANES_PER_WARP,
 
 		// Unroll tiles in batches without risk of counter overflow
-		UNROLL_COUNT				= 127 / THREAD_ELEMENTS,
+		UNROLL_COUNT				= CUB_MIN(64, 255 / THREAD_ELEMENTS),
 		UNROLLED_ELEMENTS 			= UNROLL_COUNT * TILE_ELEMENTS,
 	};
 
@@ -158,6 +158,10 @@ struct Cta
 	template <int COUNT, int MAX>
 	struct Iterate
 	{
+		enum {
+			HALF = MAX / 2,
+		};
+
 		// BucketKeys
 		static __device__ __forceinline__ void BucketKeys(
 			Cta &cta,
@@ -172,10 +176,9 @@ struct Cta
 		// ProcessTiles
 		static __device__ __forceinline__ void ProcessTiles(Cta &cta, SizeT cta_offset)
 		{
-			cta.ProcessFullTile(cta_offset);
-
 			// Next
-			Iterate<COUNT + 1, MAX>::ProcessTiles(cta, cta_offset + TILE_ELEMENTS);
+			Iterate<1, HALF>::ProcessTiles(cta, cta_offset);
+			Iterate<1, MAX - HALF>::ProcessTiles(cta, cta_offset + (HALF * TILE_ELEMENTS));
 		}
 	};
 
@@ -187,7 +190,10 @@ struct Cta
 		static __device__ __forceinline__ void BucketKeys(Cta &cta, ConvertedKeyType keys[THREAD_ELEMENTS]) {}
 
 		// ProcessTiles
-		static __device__ __forceinline__ void ProcessTiles(Cta &cta, SizeT cta_offset) {}
+		static __device__ __forceinline__ void ProcessTiles(Cta &cta, SizeT cta_offset)
+		{
+			cta.ProcessFullTile(cta_offset);
+		}
 	};
 
 
