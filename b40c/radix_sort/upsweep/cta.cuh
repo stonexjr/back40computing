@@ -48,15 +48,13 @@ struct Cta
 	// Type definitions and constants
 	//---------------------------------------------------------------------
 
-	typedef typename KeyTraits<KeyType>::IngressOp 			IngressOp;
-	typedef typename KeyTraits<KeyType>::ConvertedKeyType 	ConvertedKeyType;
+	typedef typename KeyTraits<KeyType>::UnsignedBits 	UnsignedBits;
 
 	// Integer type for digit counters (to be packed into words of PackedCounters)
 	typedef unsigned char DigitCounter;
 
 	// Integer type for packing DigitCounters into columns of shared memory banks
-	typedef typename util::If<
-		(KernelPolicy::SMEM_8BYTE_BANKS),
+	typedef typename util::If<(KernelPolicy::SMEM_CONFIG == cudaSharedMemBankSizeEightByte),
 		unsigned long long,
 		unsigned int>::Type PackedCounter;
 
@@ -69,13 +67,13 @@ struct Cta
 		// Direction of flow though ping-pong buffers: (FLOP_TURN) ? (d_keys1 --> d_keys0) : (d_keys0 --> d_keys1)
 		FLOP_TURN					= KernelPolicy::CURRENT_PASS & 0x1,
 
-		LOG_THREADS 				= KernelPolicy::LOG_THREADS,
-		THREADS						= 1 << LOG_THREADS,
+		LOG_CTA_THREADS 				= KernelPolicy::LOG_CTA_THREADS,
+		CTA_THREADS						= 1 << LOG_CTA_THREADS,
 
 		LOG_WARP_THREADS 			= CUB_LOG_WARP_THREADS(__CUB_CUDA_ARCH__),
 		WARP_THREADS				= 1 << LOG_WARP_THREADS,
 
-		LOG_WARPS					= LOG_THREADS - LOG_WARP_THREADS,
+		LOG_WARPS					= LOG_CTA_THREADS - LOG_WARP_THREADS,
 		WARPS						= 1 << LOG_WARPS,
 
 		LOG_LOAD_VEC_SIZE  			= KernelPolicy::LOG_LOAD_VEC_SIZE,
@@ -87,7 +85,7 @@ struct Cta
 		LOG_THREAD_ELEMENTS			= LOG_LOAD_VEC_SIZE + LOG_LOADS_PER_TILE,
 		THREAD_ELEMENTS				= 1 << LOG_THREAD_ELEMENTS,
 
-		LOG_TILE_ELEMENTS 			= LOG_THREAD_ELEMENTS + LOG_THREADS,
+		LOG_TILE_ELEMENTS 			= LOG_THREAD_ELEMENTS + LOG_CTA_THREADS,
 		TILE_ELEMENTS				= 1 << LOG_TILE_ELEMENTS,
 
 		BYTES_PER_COUNTER			= sizeof(DigitCounter),
@@ -120,8 +118,8 @@ struct Cta
 	{
 		union {
 			unsigned char	counter_base[1];
-			DigitCounter 	digit_counters[COUNTER_LANES][THREADS][PACKING_RATIO];
-			PackedCounter 	packed_counters[COUNTER_LANES][THREADS];
+			DigitCounter 	digit_counters[COUNTER_LANES][CTA_THREADS][PACKING_RATIO];
+			PackedCounter 	packed_counters[COUNTER_LANES][CTA_THREADS];
 			SizeT 			digit_partials[RADIX_DIGITS][WARP_THREADS + 1];
 		};
 	};
@@ -138,11 +136,8 @@ struct Cta
 	SizeT 				local_counts[LANES_PER_WARP][PACKING_RATIO];
 
 	// Input and output device pointers
-	ConvertedKeyType	*d_in_keys;
+	UnsignedBits		*d_in_keys;
 	SizeT				*d_spine;
-
-	// Bit-twiddling operator needed to make keys suitable for radix sorting
-	IngressOp			ingress_op;
 
 	int 				warp_id;
 	int 				warp_tid;
@@ -159,13 +154,13 @@ struct Cta
 	struct Iterate
 	{
 		enum {
-			HALF = MAX / 2,
+			HALF = (MAX / 2),
 		};
 
 		// BucketKeys
 		static __device__ __forceinline__ void BucketKeys(
 			Cta &cta,
-			ConvertedKeyType keys[THREAD_ELEMENTS])
+			UnsignedBits keys[THREAD_ELEMENTS])
 		{
 			cta.Bucket(keys[COUNT]);
 
@@ -187,7 +182,7 @@ struct Cta
 	struct Iterate<MAX, MAX>
 	{
 		// BucketKeys
-		static __device__ __forceinline__ void BucketKeys(Cta &cta, ConvertedKeyType keys[THREAD_ELEMENTS]) {}
+		static __device__ __forceinline__ void BucketKeys(Cta &cta, UnsignedBits keys[THREAD_ELEMENTS]) {}
 
 		// ProcessTiles
 		static __device__ __forceinline__ void ProcessTiles(Cta &cta, SizeT cta_offset)
@@ -210,7 +205,7 @@ struct Cta
 		KeyType 		*d_keys0,
 		KeyType 		*d_keys1) :
 			smem_storage(smem_storage),
-			d_in_keys(reinterpret_cast<ConvertedKeyType*>(FLOP_TURN ? d_keys1 : d_keys0)),
+			d_in_keys(reinterpret_cast<UnsignedBits*>(FLOP_TURN ? d_keys1 : d_keys0)),
 			d_spine(d_spine),
 			warp_id(threadIdx.x >> LOG_WARP_THREADS),
 			warp_tid(util::LaneId())
@@ -222,13 +217,13 @@ struct Cta
 	/**
 	 * Decode a key and increment corresponding smem digit counter
 	 */
-	__device__ __forceinline__ void Bucket(ConvertedKeyType key)
+	__device__ __forceinline__ void Bucket(UnsignedBits key)
 	{
 		// Compute byte offset of smem counter.  Add in thread column.
 		unsigned int byte_offset = (threadIdx.x << (LOG_PACKING_RATIO + LOG_BYTES_PER_COUNTER));
 
 		// Perform transform op
-		ConvertedKeyType converted_key = ingress_op(key);
+		UnsignedBits converted_key = KeyTraits<KeyType>::TwiddleIn(key);
 
 		// Add in sub-counter byte_offset
 		byte_offset = Extract<
@@ -242,7 +237,7 @@ struct Cta
 		byte_offset = Extract<
 			CURRENT_BIT + LOG_PACKING_RATIO,
 			LOG_COUNTER_LANES,
-			LOG_THREADS + (LOG_PACKING_RATIO + LOG_BYTES_PER_COUNTER)>(
+			LOG_CTA_THREADS + (LOG_PACKING_RATIO + LOG_BYTES_PER_COUNTER)>(
 				converted_key,
 				byte_offset);
 
@@ -296,12 +291,12 @@ struct Cta
 				const int COUNTER_LANE = LANE * WARPS;
 
 				#pragma unroll
-				for (int PACKED_COUNTER = 0; PACKED_COUNTER < THREADS; PACKED_COUNTER += WARP_THREADS)
+				for (int PACKED_COUNTER = 0; PACKED_COUNTER < CTA_THREADS; PACKED_COUNTER += WARP_THREADS)
 				{
 					#pragma unroll
 					for (int UNPACKED_COUNTER = 0; UNPACKED_COUNTER < PACKING_RATIO; UNPACKED_COUNTER++)
 					{
-						const int OFFSET = (((COUNTER_LANE * THREADS) + PACKED_COUNTER) * PACKING_RATIO) + UNPACKED_COUNTER;
+						const int OFFSET = (((COUNTER_LANE * CTA_THREADS) + PACKED_COUNTER) * PACKING_RATIO) + UNPACKED_COUNTER;
 						local_counts[LANE][UNPACKED_COUNTER] += *(base_counter + OFFSET);
 					}
 				}
@@ -356,16 +351,16 @@ struct Cta
 	__device__ __forceinline__ void ProcessFullTile(SizeT cta_offset)
 	{
 		// Tile of keys
-		ConvertedKeyType keys[LOADS_PER_TILE][LOAD_VEC_SIZE];
+		UnsignedBits keys[LOADS_PER_TILE][LOAD_VEC_SIZE];
 
 		// Read tile of keys
 		util::io::LoadTile<
 			LOG_LOADS_PER_TILE,
 			LOG_LOAD_VEC_SIZE,
-			THREADS,
+			CTA_THREADS,
 			KernelPolicy::LOAD_MODIFIER,
 			false>::LoadValid(
-				(ConvertedKeyType (*)[LOAD_VEC_SIZE]) keys,
+				(UnsignedBits (*)[LOAD_VEC_SIZE]) keys,
 				d_in_keys,
 				cta_offset);
 
@@ -373,7 +368,7 @@ struct Cta
 		if (LOADS_PER_TILE > 1) __syncthreads();
 
 		// Bucket tile of keys
-		Iterate<0, THREAD_ELEMENTS>::BucketKeys(*this, (ConvertedKeyType*) keys);
+		Iterate<0, THREAD_ELEMENTS>::BucketKeys(*this, (UnsignedBits*) keys);
 	}
 
 
@@ -389,9 +384,9 @@ struct Cta
 		while (cta_offset < out_of_bounds)
 		{
 			// Load and bucket key
-			ConvertedKeyType key = d_in_keys[cta_offset];
+			UnsignedBits key = d_in_keys[cta_offset];
 			Bucket(key);
-			cta_offset += THREADS;
+			cta_offset += CTA_THREADS;
 		}
 	}
 
