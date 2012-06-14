@@ -183,7 +183,7 @@ struct Cta
 		/**
 		 * Scatter items to global memory
 		 */
-		template <typename T>
+		template <bool FULL_TILE, typename T>
 		static __device__ __forceinline__ void ScatterGlobal(
 			T 				items[KEYS_PER_THREAD],
 			SizeT			digit_offsets[KEYS_PER_THREAD],
@@ -194,20 +194,21 @@ struct Cta
 			int tile_element = threadIdx.x + (COUNT * CTA_THREADS);
 			T* scatter = d_out + threadIdx.x + (COUNT * CTA_THREADS) + digit_offsets[COUNT];
 
-			if ((guarded_elements >= TILE_ELEMENTS) || (tile_element < guarded_elements))
+			if (FULL_TILE || (tile_element < guarded_elements))
 			{
 				util::io::ModifiedStore<STORE_MODIFIER>::St(items[COUNT], scatter);
 			}
 
 			// Iterate next element
-			Iterate<COUNT + 1, MAX>::ScatterGlobal(items, digit_offsets, d_out, guarded_elements);
+			Iterate<COUNT + 1, MAX>::template ScatterGlobal<FULL_TILE>(
+				items, digit_offsets, d_out, guarded_elements);
 		}
 
 
 		/**
 		 * Scatter items to global memory
 		 */
-		template <typename T>
+		template <bool FULL_TILE, typename T>
 		static __device__ __forceinline__ void ScatterGlobal(
 			T 				items[KEYS_PER_THREAD],
 			unsigned int 	ranks[KEYS_PER_THREAD],
@@ -218,13 +219,14 @@ struct Cta
 			// Scatter if not out-of-bounds
 			T* scatter = d_out + ranks[COUNT] + digit_offsets[COUNT];
 
-			if ((guarded_elements >= TILE_ELEMENTS) || (ranks[COUNT] < guarded_elements))
+			if (FULL_TILE || (ranks[COUNT] < guarded_elements))
 			{
 				util::io::ModifiedStore<STORE_MODIFIER>::St(items[COUNT], scatter);
 			}
 
 			// Iterate next element
-			Iterate<COUNT + 1, MAX>::ScatterGlobal(items, ranks, digit_offsets, d_out, guarded_elements);
+			Iterate<COUNT + 1, MAX>::template ScatterGlobal<FULL_TILE>(
+				items, ranks, digit_offsets, d_out, guarded_elements);
 		}
 
 
@@ -281,11 +283,11 @@ struct Cta
 	struct Iterate<MAX, MAX>
 	{
 		// ScatterGlobal
-		template <typename T>
+		template <bool FULL_TILE, typename T>
 		static __device__ __forceinline__ void ScatterGlobal(T[KEYS_PER_THREAD], SizeT[KEYS_PER_THREAD], T*, const SizeT &) {}
 
 		// ScatterGlobal
-		template <typename T>
+		template <bool FULL_TILE, typename T>
 		static __device__ __forceinline__ void ScatterGlobal(T[KEYS_PER_THREAD], unsigned int[KEYS_PER_THREAD], SizeT[KEYS_PER_THREAD], T*, const SizeT &) {}
 
 		// AlignedScatterPass
@@ -406,12 +408,13 @@ struct Cta
 	/**
 	 * Load tile of keys from global memory
 	 */
+	template <bool FULL_TILE>
 	__device__ __forceinline__ void LoadKeys(
 		UnsignedBits 	keys[KEYS_PER_THREAD],
 		SizeT 			tex_offset,
 		const SizeT 	&guarded_elements)
 	{
-		if ((LOAD_MODIFIER == util::io::ld::tex) && (guarded_elements >= TILE_ELEMENTS))
+		if ((LOAD_MODIFIER == util::io::ld::tex) && FULL_TILE)
 		{
 			// Unguarded loads through tex
 			KeyTexType *vectors = (KeyTexType *) keys;
@@ -445,6 +448,7 @@ struct Cta
 	/**
 	 * Load tile of values from global memory
 	 */
+	template <bool FULL_TILE>
 	__device__ __forceinline__ void LoadValues(
 		ValueType 		values[KEYS_PER_THREAD],
 		SizeT 			tex_offset,
@@ -452,7 +456,7 @@ struct Cta
 	{
 		if ((LOAD_MODIFIER == util::io::ld::tex) &&
 			(util::NumericTraits<ValueType>::BUILT_IN) &&
-			(guarded_elements >= TILE_ELEMENTS))
+			FULL_TILE)
 		{
 			// Unguarded loads through tex
 			ValueTexType *vectors = (ValueTexType*) values;
@@ -486,6 +490,7 @@ struct Cta
 	 * Gather keys from smem, decode base digit offsets for keys,4
 	 * and scatter to global
 	 */
+	template <bool FULL_TILE>
 	__device__ __forceinline__ void ScatterKeys(
 		UnsignedBits 	twiddled_keys[KEYS_PER_THREAD],
 		SizeT 			digit_offsets[KEYS_PER_THREAD],		// (out parameter)
@@ -504,7 +509,7 @@ struct Cta
 			TwiddleKeys<KeyTraits<KeyType>::TwiddleOut>(twiddled_keys, keys);
 
 			// Scatter to global
-			Iterate<0, KEYS_PER_THREAD>::ScatterGlobal(
+			Iterate<0, KEYS_PER_THREAD>::template ScatterGlobal<FULL_TILE>(
 				keys,
 				ranks,
 				digit_offsets,
@@ -518,8 +523,6 @@ struct Cta
 			// Untwiddle keys before outputting
 			UnsignedBits keys[KEYS_PER_THREAD];
 			TwiddleKeys<KeyTraits<KeyType>::TwiddleOut>(twiddled_keys, keys);
-
-			__syncthreads();
 
 			// Scatter to shared memory first
 			ScatterRanked(ranks, keys, smem_storage.key_exchange);
@@ -538,8 +541,6 @@ struct Cta
 			// Normal two-phase scatter: exchange through shared memory, then
 			// scatter sorted keys to global
 
-			__syncthreads();
-
 			// Scatter to shared memory first (for better write-coalescing during global scatter)
 			ScatterRanked(ranks, twiddled_keys, smem_storage.key_exchange);
 
@@ -556,7 +557,7 @@ struct Cta
 			TwiddleKeys<KeyTraits<KeyType>::TwiddleOut>(twiddled_keys, keys);
 
 			// Scatter keys to global memory
-			Iterate<0, KEYS_PER_THREAD>::ScatterGlobal(
+			Iterate<0, KEYS_PER_THREAD>::template ScatterGlobal<FULL_TILE>(
 				keys,
 				digit_offsets,
 				d_out_keys,
@@ -568,7 +569,7 @@ struct Cta
 	/**
 	 * Truck along associated values
 	 */
-	template <typename _ValueType>
+	template <bool FULL_TILE, typename _ValueType>
 	__device__ __forceinline__ void GatherScatterValues(
 		_ValueType 		values[KEYS_PER_THREAD],
 		SizeT 			digit_offsets[KEYS_PER_THREAD],
@@ -576,49 +577,51 @@ struct Cta
 		SizeT 			tex_offset,
 		const SizeT 	&guarded_elements)
 	{
+		__syncthreads();
+
 		// Load tile of values
-		LoadValues(values, tex_offset, guarded_elements);
+		LoadValues<FULL_TILE>(values, tex_offset, guarded_elements);
 
 		if (SCATTER_STRATEGY == SCATTER_DIRECT)
 		{
 			// Scatter values directly to global memory
-			Iterate<0, KEYS_PER_THREAD>::ScatterGlobal(
+			Iterate<0, KEYS_PER_THREAD>::template ScatterGlobal<FULL_TILE>(
 				values,
 				ranks,
 				digit_offsets,
 				d_out_values,
 				guarded_elements);
 		}
-		else
+		else if (SCATTER_STRATEGY == SCATTER_WARP_TWO_PHASE)
 		{
-			__syncthreads();
-
 			// Exchange values through shared memory for better write-coalescing
 			ScatterRanked(ranks, values, smem_storage.value_exchange);
 
 			__syncthreads();
 
-			if (SCATTER_STRATEGY == SCATTER_WARP_TWO_PHASE)
-			{
-				// Use explicitly warp-aligned scattering of values from shared memory
-				Iterate<0, SCATTER_PASSES>::AlignedScatterPass(
-					smem_storage,
-					smem_storage.value_exchange,
-					d_out_values,
-					guarded_elements);
-			}
-			else
-			{
-				// Gather values from shared
-				GatherShared(values, smem_storage.value_exchange);
+			// Use explicitly warp-aligned scattering of values from shared memory
+			Iterate<0, SCATTER_PASSES>::AlignedScatterPass(
+				smem_storage,
+				smem_storage.value_exchange,
+				d_out_values,
+				guarded_elements);
+		}
+		else
+		{
+			// Exchange values through shared memory for better write-coalescing
+			ScatterRanked(ranks, values, smem_storage.value_exchange);
 
-				// Scatter to global memory
-				Iterate<0, KEYS_PER_THREAD>::ScatterGlobal(
-					values,
-					digit_offsets,
-					d_out_values,
-					guarded_elements);
-			}
+			__syncthreads();
+
+			// Gather values from shared
+			GatherShared(values, smem_storage.value_exchange);
+
+			// Scatter to global memory
+			Iterate<0, KEYS_PER_THREAD>::template ScatterGlobal<FULL_TILE>(
+				values,
+				digit_offsets,
+				d_out_values,
+				guarded_elements);
 		}
 	}
 
@@ -626,6 +629,7 @@ struct Cta
 	/**
 	 * Truck along associated values (specialized for key-only sorting)
 	 */
+	template <bool FULL_TILE>
 	__device__ __forceinline__ void GatherScatterValues(
 		util::NullType	values[KEYS_PER_THREAD],
 		SizeT 			digit_offsets[KEYS_PER_THREAD],
@@ -638,6 +642,7 @@ struct Cta
 	/**
 	 * Process tile
 	 */
+	template <bool FULL_TILE>
 	__device__ __forceinline__ void ProcessTile(
 		SizeT tex_offset,
 		const SizeT &guarded_elements = TILE_ELEMENTS)
@@ -653,7 +658,7 @@ struct Cta
 		unsigned int exclusive_digit_count;						// Exclusive digit count for each digit (corresponding to thread-id)
 
 		// Load tile of keys and twiddle bits if necessary
-		LoadKeys(keys, tex_offset, guarded_elements);
+		LoadKeys<FULL_TILE>(keys, tex_offset, guarded_elements);
 
 		__syncthreads();
 
@@ -687,10 +692,10 @@ struct Cta
 		__syncthreads();
 
 		// Scatter keys
-		ScatterKeys(twiddled_keys, digit_offsets, ranks, guarded_elements);
+		ScatterKeys<FULL_TILE>(twiddled_keys, digit_offsets, ranks, guarded_elements);
 
 		// Gather/scatter values
-		GatherScatterValues(values, digit_offsets, ranks, tex_offset, guarded_elements);
+		GatherScatterValues<FULL_TILE>(values, digit_offsets, ranks, tex_offset, guarded_elements);
 	}
 
 
@@ -706,14 +711,14 @@ struct Cta
 		// Process full tiles of tile_elements
 		while (tex_offset < smem_storage.tex_offset_limit)
 		{
-			ProcessTile(tex_offset);
+			ProcessTile<true>(tex_offset);
 			tex_offset += TILE_TEX_LOADS;
 		}
 
 		// Clean up last partial tile with guarded-io
 		if (work_limits.guarded_elements)
 		{
-			ProcessTile(tex_offset, work_limits.guarded_elements);
+			ProcessTile<false>(tex_offset, work_limits.guarded_elements);
 		}
 	}
 };
