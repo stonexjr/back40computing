@@ -313,8 +313,8 @@ struct Cta
 		SizeT 			*d_spine,
 		unsigned int 	current_bit) :
 			smem_storage(smem_storage),
-			d_in_keys(d_in_keys),
-			d_out_keys(d_out_keys),
+			d_in_keys(reinterpret_cast<UnsignedBits*>(d_in_keys)),
+			d_out_keys(reinterpret_cast<UnsignedBits*>(d_out_keys)),
 			d_in_values(d_in_values),
 			d_out_values(d_out_values),
 			current_bit(current_bit)
@@ -446,7 +446,7 @@ struct Cta
 				int thread_offset = (threadIdx.x * KEYS_PER_THREAD) + KEY;
 
 				keys[KEY] = (thread_offset < guarded_elements) ?
-					*(d_in_keys + (tex_offset * THREAD_TEX_LOADS) + guarded_elements) :
+					*(d_in_keys + (tex_offset * THREAD_TEX_LOADS) + thread_offset) :
 					MAX_KEY;
 			}
 		}
@@ -492,7 +492,7 @@ struct Cta
 
 				if (thread_offset < guarded_elements)
 				{
-					values[KEY] = *(d_in_values + (tex_offset * THREAD_TEX_LOADS) + guarded_elements);
+					values[KEY] = *(d_in_values + (tex_offset * THREAD_TEX_LOADS) + thread_offset);
 				}
 			}
 		}
