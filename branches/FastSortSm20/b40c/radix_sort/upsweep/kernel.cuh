@@ -45,9 +45,9 @@ __launch_bounds__ (KernelPolicy::CTA_THREADS, KernelPolicy::MIN_CTA_OCCUPANCY)
 __global__
 void Kernel(
 	SizeT 		*d_spine,
-	KeyType 	*d_keys0,
-	KeyType 	*d_keys1,
-	util::CtaWorkDistribution<SizeT> work_decomposition)
+	KeyType 	*d_in_keys,
+	util::CtaWorkDistribution<SizeT> work_decomposition,
+	unsigned int current_bit)
 {
 	// CTA abstraction type
 	typedef Cta<KernelPolicy, SizeT, KeyType> Cta;
@@ -61,7 +61,8 @@ void Kernel(
 		work_limits,
 		KernelPolicy::LOG_TILE_ELEMENTS);
 
-	Cta cta(smem_storage, d_spine, d_keys0, d_keys1);
+	Cta cta(smem_storage, d_spine, d_in_keys, current_bit);
+
 	cta.ProcessWorkRange(work_limits);
 }
 

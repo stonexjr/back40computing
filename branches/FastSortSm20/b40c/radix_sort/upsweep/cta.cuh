@@ -59,16 +59,11 @@ struct Cta
 		unsigned int>::Type PackedCounter;
 
 	enum {
-		CURRENT_BIT 				= KernelPolicy::CURRENT_BIT,
-		CURRENT_PASS 				= KernelPolicy::CURRENT_PASS,
 		RADIX_BITS					= KernelPolicy::RADIX_BITS,
 		RADIX_DIGITS 				= 1 << RADIX_BITS,
 
-		// Direction of flow though ping-pong buffers: (FLOP_TURN) ? (d_keys1 --> d_keys0) : (d_keys0 --> d_keys1)
-		FLOP_TURN					= KernelPolicy::CURRENT_PASS & 0x1,
-
-		LOG_CTA_THREADS 				= KernelPolicy::LOG_CTA_THREADS,
-		CTA_THREADS						= 1 << LOG_CTA_THREADS,
+		LOG_CTA_THREADS 			= KernelPolicy::LOG_CTA_THREADS,
+		CTA_THREADS					= 1 << LOG_CTA_THREADS,
 
 		LOG_WARP_THREADS 			= CUB_LOG_WARP_THREADS(__CUB_CUDA_ARCH__),
 		WARP_THREADS				= 1 << LOG_WARP_THREADS,
@@ -139,10 +134,15 @@ struct Cta
 	UnsignedBits		*d_in_keys;
 	SizeT				*d_spine;
 
+	// Warp-id and lane-id
 	int 				warp_id;
 	int 				warp_tid;
 
 	DigitCounter		*base_counter;
+
+	// The least-significant bit position of the current digit to extract
+	unsigned int 		current_bit;
+
 
 
 	//---------------------------------------------------------------------
@@ -202,13 +202,14 @@ struct Cta
 	__device__ __forceinline__ Cta(
 		SmemStorage 	&smem_storage,
 		SizeT 			*d_spine,
-		KeyType 		*d_keys0,
-		KeyType 		*d_keys1) :
+		KeyType 		*d_in_keys,
+		unsigned int 	current_bit) :
 			smem_storage(smem_storage),
-			d_in_keys(reinterpret_cast<UnsignedBits*>(FLOP_TURN ? d_keys1 : d_keys0)),
+			d_in_keys(d_in_keys),
 			d_spine(d_spine),
 			warp_id(threadIdx.x >> LOG_WARP_THREADS),
-			warp_tid(util::LaneId())
+			warp_tid(util::LaneId()),
+			current_bit(current_bit)
 	{
 		base_counter = smem_storage.digit_counters[warp_id][warp_tid];
 	}
@@ -219,31 +220,18 @@ struct Cta
 	 */
 	__device__ __forceinline__ void Bucket(UnsignedBits key)
 	{
-		// Compute byte offset of smem counter.  Add in thread column.
-		unsigned int byte_offset = (threadIdx.x << (LOG_PACKING_RATIO + LOG_BYTES_PER_COUNTER));
-
 		// Perform transform op
 		UnsignedBits converted_key = KeyTraits<KeyType>::TwiddleIn(key);
 
-		// Add in sub-counter byte_offset
-		byte_offset = Extract<
-			CURRENT_BIT,
-			LOG_PACKING_RATIO,
-			LOG_BYTES_PER_COUNTER>(
-				converted_key,
-				byte_offset);
+		// Add in sub-counter offset
+		UnsignedBits sub_counter = util::BFE(converted_key, current_bit, LOG_PACKING_RATIO);
 
-		// Add in row byte_offset
-		byte_offset = Extract<
-			CURRENT_BIT + LOG_PACKING_RATIO,
-			LOG_COUNTER_LANES,
-			LOG_CTA_THREADS + (LOG_PACKING_RATIO + LOG_BYTES_PER_COUNTER)>(
-				converted_key,
-				byte_offset);
+		// Add in row offset
+		UnsignedBits row_offset = util::BFE(converted_key, current_bit + LOG_PACKING_RATIO, LOG_COUNTER_LANES);
 
 		// Increment counter
-		DigitCounter *counter = (DigitCounter*) (smem_storage.counter_base + byte_offset);
-		(*counter)++;
+		smem_storage.digit_counters[row_offset][threadIdx.x][sub_counter]++;
+
 	}
 
 
@@ -360,7 +348,7 @@ struct Cta
 			CTA_THREADS,
 			KernelPolicy::LOAD_MODIFIER,
 			false>::LoadValid(
-				(UnsignedBits (*)[LOAD_VEC_SIZE]) keys,
+				keys,
 				d_in_keys,
 				cta_offset);
 
