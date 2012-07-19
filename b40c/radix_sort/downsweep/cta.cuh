@@ -242,8 +242,6 @@ struct Cta
 			T 				*d_out,
 			SizeT 			valid_elements)
 		{
-			typedef typename CtaRadixRank::PackedCounter PackedCounter;
-
 			int store_txn_idx 		= threadIdx.x & (STORE_TXN_THREADS - 1);
 			int store_txn_digit 	= threadIdx.x >> LOG_STORE_TXN_THREADS;
 			int my_digit 			= (COUNT * DIGITS_PER_SCATTER_PASS) + store_txn_digit;
@@ -500,8 +498,7 @@ struct Cta
 
 
 	/**
-	 * Gather keys from smem, decode base digit offsets for keys,4
-	 * and scatter to global
+	 * Scatter ranked keys to global memory
 	 */
 	template <bool FULL_TILE>
 	__device__ __forceinline__ void ScatterKeys(
