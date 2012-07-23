@@ -112,11 +112,6 @@ struct Cta
 	typedef typename Textures::KeyTexType 									KeyTexType;
 	typedef typename Textures::ValueTexType 								ValueTexType;
 
-	// Corresponding texture vector types (we may have a different tex vector type than item vector type)
-	typedef typename util::VecType<UnsignedBits, ELEMENTS_PER_TEX>::Type 	KeyVectorType;
-	typedef typename util::VecType<ValueType, ELEMENTS_PER_TEX>::Type 		ValueVectorType;
-
-
 	// CtaRadixRank utility type
 	typedef CtaRadixRank<
 		CTA_THREADS,
@@ -415,7 +410,7 @@ struct Cta
 	__device__ __forceinline__ void LoadKeys(
 		UnsignedBits 	keys[KEYS_PER_THREAD],
 		SizeT 			tex_offset,
-		SizeT 			guarded_elements)
+		const SizeT 	&guarded_elements)
 	{
 
 		if ((LOAD_MODIFIER == util::io::ld::tex) && FULL_TILE)
@@ -424,16 +419,18 @@ struct Cta
 			#pragma unroll
 			for (int PACK = 0; PACK < THREAD_TEX_LOADS; PACK++)
 			{
-				KeyVectorType vector;
-				KeyTexType *tex_vector = reinterpret_cast<KeyTexType*>(&vector);
-
 				// Load tex vector
-				tex_vector[0] = tex1Dfetch(
-					TexKeys<KeyTexType>::ref,
-					tex_offset + (threadIdx.x * THREAD_TEX_LOADS) + PACK);
+				KeyTexType tex_vector = tex1Dfetch(
+						TexKeys<KeyTexType>::ref,
+						tex_offset + (threadIdx.x * THREAD_TEX_LOADS) + PACK);
 
-				// Copy fields
-				util::VecCopy(keys + (PACK * ELEMENTS_PER_TEX), vector);
+				UnsignedBits *vector = reinterpret_cast<UnsignedBits*>(&tex_vector);
+
+				#pragma unroll
+				for (int KEY = 0; KEY < ELEMENTS_PER_TEX; KEY++)
+				{
+					keys[(PACK * ELEMENTS_PER_TEX) + KEY] = vector[KEY];
+				}
 			}
 		}
 		else
@@ -459,27 +456,28 @@ struct Cta
 	__device__ __forceinline__ void LoadValues(
 		ValueType 		values[KEYS_PER_THREAD],
 		SizeT 			tex_offset,
-		SizeT 			guarded_elements)
+		const SizeT 	&guarded_elements)
 	{
 		if ((LOAD_MODIFIER == util::io::ld::tex) &&
 			(util::NumericTraits<ValueType>::BUILT_IN) &&
 			FULL_TILE)
 		{
-
 			// Unguarded loads through tex
 			#pragma unroll
 			for (int PACK = 0; PACK < THREAD_TEX_LOADS; PACK++)
 			{
-				ValueVectorType vector;
-				ValueTexType *tex_vector = reinterpret_cast<ValueTexType*>(&vector);
-
 				// Load tex vector
-				tex_vector[0] = tex1Dfetch(
-					TexValues<ValueTexType>::ref,
-					tex_offset + (threadIdx.x * THREAD_TEX_LOADS) + PACK);
+				ValueTexType tex_vector = tex1Dfetch(
+						TexValues<ValueTexType>::ref,
+						tex_offset + (threadIdx.x * THREAD_TEX_LOADS) + PACK);
 
-				// Copy fields
-				util::VecCopy(values + (PACK * ELEMENTS_PER_TEX), vector);
+				ValueType *vector = reinterpret_cast<ValueType*>(&tex_vector);
+
+				#pragma unroll
+				for (int KEY = 0; KEY < ELEMENTS_PER_TEX; KEY++)
+				{
+					values[(PACK * ELEMENTS_PER_TEX) + KEY] = vector[KEY];
+				}
 			}
 		}
 		else
@@ -659,7 +657,7 @@ struct Cta
 	template <bool FULL_TILE>
 	__device__ __forceinline__ void ProcessTile(
 		SizeT tex_offset,
-		SizeT guarded_elements = TILE_ELEMENTS)
+		const SizeT &guarded_elements = TILE_ELEMENTS)
 	{
 		// Per-thread tile data
 		UnsignedBits 	keys[KEYS_PER_THREAD];					// Keys
@@ -707,7 +705,7 @@ struct Cta
 	/**
 	 * Process work range of tiles
 	 */
-	__device__ __forceinline__ void ProcessWorkRange(SizeT guarded_elements)
+	__device__ __forceinline__ void ProcessWorkRange(const SizeT &guarded_elements)
 	{
 		// Make sure we get a local copy of the cta's offset (work_limits may be in smem)
 		SizeT tex_offset = smem_storage.tex_offset;
