@@ -111,8 +111,8 @@ struct Cta
 	 */
 	struct SmemStorage
 	{
-		union {
-			unsigned char	counter_base[1];
+		union
+		{
 			DigitCounter 	digit_counters[COUNTER_LANES][CTA_THREADS][PACKING_RATIO];
 			PackedCounter 	packed_counters[COUNTER_LANES][CTA_THREADS];
 			SizeT 			digit_partials[RADIX_DIGITS][WARP_THREADS + 1];
@@ -133,12 +133,6 @@ struct Cta
 	// Input and output device pointers
 	UnsignedBits		*d_in_keys;
 	SizeT				*d_spine;
-
-	// Warp-id and lane-id
-	int 				warp_id;
-	int 				warp_tid;
-
-	DigitCounter		*base_counter;
 
 	// The least-significant bit position of the current digit to extract
 	unsigned int 		current_bit;
@@ -207,12 +201,8 @@ struct Cta
 			smem_storage(smem_storage),
 			d_in_keys(reinterpret_cast<UnsignedBits*>(d_in_keys)),
 			d_spine(d_spine),
-			warp_id(threadIdx.x >> LOG_WARP_THREADS),
-			warp_tid(util::LaneId()),
 			current_bit(current_bit)
-	{
-		base_counter = smem_storage.digit_counters[warp_id][warp_tid];
-	}
+	{}
 
 
 	/**
@@ -271,6 +261,9 @@ struct Cta
 	 */
 	__device__ __forceinline__ void UnpackDigitCounts()
 	{
+		unsigned int warp_id = threadIdx.x >> LOG_WARP_THREADS;
+		unsigned int warp_tid = threadIdx.x & (WARP_THREADS - 1);
+
 		if (warp_id < COUNTER_LANES)
 		{
 			#pragma unroll
@@ -285,7 +278,7 @@ struct Cta
 					for (int UNPACKED_COUNTER = 0; UNPACKED_COUNTER < PACKING_RATIO; UNPACKED_COUNTER++)
 					{
 						const int OFFSET = (((COUNTER_LANE * CTA_THREADS) + PACKED_COUNTER) * PACKING_RATIO) + UNPACKED_COUNTER;
-						local_counts[LANE][UNPACKED_COUNTER] += *(base_counter + OFFSET);
+						local_counts[LANE][UNPACKED_COUNTER] += smem_storage.digit_counters[warp_id][warp_tid][OFFSET];
 					}
 				}
 			}
@@ -298,6 +291,9 @@ struct Cta
 	 */
 	__device__ __forceinline__ void ReduceUnpackedCounts()
 	{
+		unsigned int warp_id = threadIdx.x >> LOG_WARP_THREADS;
+		unsigned int warp_tid = threadIdx.x & (WARP_THREADS - 1);
+
 		// Place unpacked digit counters in shared memory
 		if (warp_id < COUNTER_LANES)
 		{
