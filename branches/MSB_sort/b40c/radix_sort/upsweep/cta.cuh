@@ -49,7 +49,7 @@ struct Cta
 	// Type definitions and constants
 	//---------------------------------------------------------------------
 
-	typedef typename KeyTraits<KeyType>::UnsignedBits 	UnsignedBits;
+	typedef typename KeyTraits<KeyType>::UnsignedBits UnsignedBits;
 
 	// Integer type for digit counters (to be packed into words of PackedCounters)
 	typedef unsigned char DigitCounter;
@@ -59,7 +59,8 @@ struct Cta
 		unsigned long long,
 		unsigned int>::Type PackedCounter;
 
-	enum {
+	enum
+	{
 		RADIX_BITS					= KernelPolicy::RADIX_BITS,
 		RADIX_DIGITS 				= 1 << RADIX_BITS,
 
@@ -127,7 +128,6 @@ struct Cta
 
 	// Input and output device pointers
 	UnsignedBits		*d_in_keys;
-	SizeT				*d_spine;
 
 	// The least-significant bit position of the current digit to extract
 	unsigned int 		current_bit;
@@ -182,20 +182,18 @@ struct Cta
 
 
 	//---------------------------------------------------------------------
-	// Methods
+	// Utility methods
 	//---------------------------------------------------------------------
 
 	/**
 	 * Constructor
 	 */
 	__device__ __forceinline__ Cta(
-		SmemStorage 	&smem_storage,
-		SizeT 			*d_spine,
+		SmemStorage		&smem_storage,
 		KeyType 		*d_in_keys,
 		unsigned int 	current_bit) :
 			smem_storage(smem_storage),
 			d_in_keys(reinterpret_cast<UnsignedBits*>(d_in_keys)),
-			d_spine(d_spine),
 			current_bit(current_bit)
 	{}
 
@@ -284,7 +282,7 @@ struct Cta
 	/**
 	 * Places unpacked counters into smem for final digit reduction
 	 */
-	__device__ __forceinline__ void ReduceUnpackedCounts()
+	__device__ __forceinline__ void ReduceUnpackedCounts(SizeT &bin_count)
 	{
 		unsigned int warp_id = threadIdx.x >> LOG_WARP_THREADS;
 		unsigned int warp_tid = threadIdx.x & (WARP_THREADS - 1);
@@ -309,17 +307,11 @@ struct Cta
 
 		__syncthreads();
 
-		// Rake-reduce and write out the bin_count reductions
+		// Rake-reduce bin_count reductions
 		if (threadIdx.x < RADIX_DIGITS)
 		{
-			SizeT bin_count = util::reduction::SerialReduce<WARP_THREADS>::Invoke(
+			bin_count = util::reduction::SerialReduce<WARP_THREADS>::Invoke(
 				smem_storage.digit_partials[threadIdx.x]);
-
-			int spine_bin_offset = (gridDim.x * threadIdx.x) + blockIdx.x;
-
-			util::io::ModifiedStore<KernelPolicy::STORE_MODIFIER>::St(
-				bin_count,
-				d_spine + spine_bin_offset);
 		}
 	}
 
@@ -362,11 +354,78 @@ struct Cta
 	}
 
 
+	//---------------------------------------------------------------------
+	// Interface
+	//---------------------------------------------------------------------
+
 	/**
-	 * Process work range of tiles
+	 * Process work range
 	 */
-	__device__ __forceinline__ void ProcessWorkRange(
-		const util::CtaWorkDistribution<SizeT> &cta_work_distribution)
+	static __device__ __forceinline__ void ProcessWorkRange(
+		SmemStorage 	&smem_storage,
+		KeyType 		*d_in_keys,
+		unsigned int 	current_bit,
+		SizeT 			cta_offset,
+		const SizeT 	&out_of_bounds,
+		SizeT 			&bin_count)
+	{
+		// Construct CTA abstraction
+		Cta cta(smem_storage, d_in_keys, current_bit);
+
+		// Reset digit counters in smem and unpacked counters in registers
+		cta.ResetDigitCounters();
+		cta.ResetUnpackedCounters();
+
+		// Unroll batches of full tiles
+		while (cta_offset + UNROLLED_ELEMENTS <= out_of_bounds)
+		{
+			Iterate<0, UNROLL_COUNT>::ProcessTiles(cta, cta_offset);
+			cta_offset += UNROLLED_ELEMENTS;
+
+			__syncthreads();
+
+			// Aggregate back into local_count registers to prevent overflow
+			cta.UnpackDigitCounts();
+
+			__syncthreads();
+
+			// Reset composite counters in lanes
+			cta.ResetDigitCounters();
+		}
+
+		// Unroll single full tiles
+		while (cta_offset + TILE_ELEMENTS <= out_of_bounds)
+		{
+			cta.ProcessFullTile(cta_offset);
+			cta_offset += TILE_ELEMENTS;
+		}
+
+		// Process partial tile if necessary
+		cta.ProcessPartialTile(
+			cta_offset,
+			out_of_bounds);
+
+		__syncthreads();
+
+		// Aggregate back into local_count registers
+		cta.UnpackDigitCounts();
+
+		__syncthreads();
+
+		// Final raking reduction of counts by bin, output to spine.
+		cta.ReduceUnpackedCounts(bin_count);
+	}
+
+
+	/**
+	 * Process work range
+	 */
+	static __device__ __forceinline__ void ProcessWorkRange(
+		SmemStorage 						&smem_storage,
+		SizeT 								*d_spine,
+		KeyType 							*d_in_keys,
+		util::CtaWorkDistribution<SizeT> 	cta_work_distribution,
+		unsigned int 						current_bit)
 	{
 		if (threadIdx.x == 0)
 		{
@@ -377,52 +436,59 @@ struct Cta
 		// Sync to acquire work limits
 		__syncthreads();
 
-		// Reset digit counters in smem and unpacked counters in registers
-		ResetDigitCounters();
-		ResetUnpackedCounters();
+		// Compute bin-count for each radix digit (valid in threadId < RADIX_DIGITS)
+		SizeT bin_count;
+		ProcessWorkRange(
+			smem_storage,
+			d_in_keys,
+			current_bit,
+			smem_storage.cta_progress.cta_offset,
+			smem_storage.cta_progress.out_of_bounds,
+			bin_count);
 
-		SizeT cta_offset = smem_storage.cta_progress.cta_offset;
-
-		// Unroll batches of full tiles
-		while (cta_offset + UNROLLED_ELEMENTS <= smem_storage.cta_progress.out_of_bounds)
+		// Write out the bin_count reductions
+		if (threadIdx.x < RADIX_DIGITS)
 		{
-			Iterate<0, UNROLL_COUNT>::ProcessTiles(*this, cta_offset);
-			cta_offset += UNROLLED_ELEMENTS;
+			int spine_bin_offset = (gridDim.x * threadIdx.x) + blockIdx.x;
 
-			__syncthreads();
-
-			// Aggregate back into local_count registers to prevent overflow
-			UnpackDigitCounts();
-
-			__syncthreads();
-
-			// Reset composite counters in lanes
-			ResetDigitCounters();
+			util::io::ModifiedStore<KernelPolicy::STORE_MODIFIER>::St(
+				bin_count,
+				d_spine + spine_bin_offset);
 		}
-
-		// Unroll single full tiles
-		while (cta_offset + TILE_ELEMENTS <= smem_storage.cta_progress.out_of_bounds)
-		{
-			ProcessFullTile(cta_offset);
-			cta_offset += TILE_ELEMENTS;
-		}
-
-		// Process partial tile if necessary
-		ProcessPartialTile(
-			cta_offset,
-			smem_storage.cta_progress.out_of_bounds);
-
-		__syncthreads();
-
-		// Aggregate back into local_count registers
-		UnpackDigitCounts();
-
-		__syncthreads();
-
-		// Final raking reduction of counts by bin, output to spine.
-		ReduceUnpackedCounts();
 	}
+
 };
+
+
+
+/**
+ * Kernel entry point
+ */
+template <
+	typename KernelPolicy,
+	typename SizeT,
+	typename KeyType>
+__launch_bounds__ (KernelPolicy::CTA_THREADS, KernelPolicy::MIN_CTA_OCCUPANCY)
+__global__
+void Kernel(
+	SizeT 								*d_spine,
+	KeyType 							*d_in_keys,
+	util::CtaWorkDistribution<SizeT> 	cta_work_distribution,
+	unsigned int 						current_bit)
+{
+	// CTA abstraction type
+	typedef Cta<KernelPolicy, SizeT, KeyType> Cta;
+
+	// Shared memory pool
+	__shared__ typename Cta::SmemStorage smem_storage;
+
+	Cta::ProcessWorkRange(
+		smem_storage,
+		d_spine,
+		d_in_keys,
+		cta_work_distribution,
+		current_bit);
+}
 
 
 
