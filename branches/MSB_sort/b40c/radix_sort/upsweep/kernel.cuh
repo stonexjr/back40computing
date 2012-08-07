@@ -55,7 +55,11 @@ void Kernel(
 	// Shared memory pool
 	__shared__ typename Cta::SmemStorage smem_storage;
 	
-	Cta cta(smem_storage, d_spine, d_in_keys, current_bit);
+	Cta cta(
+		smem_storage,
+		d_spine,
+		d_in_keys,
+		current_bit);
 
 	cta.ProcessWorkRange(cta_work_distribution);
 }

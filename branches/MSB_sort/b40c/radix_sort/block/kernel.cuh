@@ -18,49 +18,64 @@
  ******************************************************************************/
 
 /******************************************************************************
- * Configuration policy for single-CTA radix sort
+ *
  ******************************************************************************/
 
 #pragma once
 
-#include "../../util/io/modified_load.cuh"
-#include "../../util/io/modified_store.cuh"
+#include "../../radix_sort/block/cta.cuh"
 #include "../../util/ns_umbrella.cuh"
 
 B40C_NS_PREFIX
 namespace b40c {
 namespace radix_sort {
-namespace single {
+namespace block {
+
 
 /**
- * Single-CTA tuning policy.
+ *
  */
 template <
-	int 							_RADIX_BITS,			// The number of radix bits, i.e., log2(bins)
-	int 							_CTA_THREADS,			// The number of threads per CTA
-	int 							_THREAD_ELEMENTS,		// The number of consecutive keys to process per thread per tile
-	util::io::ld::CacheModifier	 	_LOAD_MODIFIER,			// Load cache-modifier
-	util::io::st::CacheModifier 	_STORE_MODIFIER,		// Store cache-modifier
-	cudaSharedMemConfig				_SMEM_CONFIG>			// Shared memory bank size
-struct KernelPolicy
+	typename KernelPolicy,
+	typename KeyType,
+	typename ValueType>
+__launch_bounds__ (KernelPolicy::CTA_THREADS, KernelPolicy::MIN_CTA_OCCUPANCY)
+__global__ 
+void Kernel(
+	Partition							*d_partitions_in,
+	Partition							*d_partitions_out,
+	KeyType 							*d_keys_in,
+	KeyType 							*d_keys_out,
+	KeyType 							*d_keys_final,
+	ValueType 							*d_values_in,
+	ValueType 							*d_values_out,
+	ValueType 							*d_values_final,
+	int									low_bit)
 {
-	enum
-	{
-		RADIX_BITS					= _RADIX_BITS,
-		CTA_THREADS 				= _CTA_THREADS,
-		THREAD_ELEMENTS 			= _THREAD_ELEMENTS,
+	// CTA abstraction type
+	typedef Cta<KernelPolicy, KeyType, ValueType> Cta;
 
-		TILE_ELEMENTS				= CTA_THREADS * THREAD_ELEMENTS,
-	};
+	// Shared memory pool
+	__shared__ typename Cta::SmemStorage smem_storage;
 
-	static const util::io::ld::CacheModifier 	LOAD_MODIFIER 		= _LOAD_MODIFIER;
-	static const util::io::st::CacheModifier 	STORE_MODIFIER 		= _STORE_MODIFIER;
-	static const cudaSharedMemConfig			SMEM_CONFIG			= _SMEM_CONFIG;
-};
+	Cta cta(
+		smem_storage,
+		d_partitions_in,
+		d_partitions_out,
+		d_keys_in,
+		d_keys_out,
+		d_keys_final,
+		d_values_in,
+		d_values_out,
+		d_values_final,
+		low_bit);
+
+	cta.ProcessWorkRange();
+}
 
 
 
-} // namespace single
-} // namespace partition
+} // namespace block
+} // namespace radix_sort
 } // namespace b40c
 B40C_NS_POSTFIX

@@ -338,9 +338,6 @@ struct Cta
 			keys[LOAD] = d_in_keys[cta_offset + threadIdx.x + (LOAD * CTA_THREADS)];
 		}
 
-		// Prevent bucketing from being hoisted (otherwise we don't get the desired outstanding loads)
-//		if (KEYS_PER_THREAD > 1) __syncthreads();
-
 		// Bucket tile of keys
 		Iterate<0, KEYS_PER_THREAD>::BucketKeys(*this, keys);
 	}
