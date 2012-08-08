@@ -34,16 +34,48 @@
 B40C_NS_PREFIX
 namespace b40c {
 namespace radix_sort {
-namespace upsweep {
+
+
+
+/**
+ * Radix sort upsweep reduction tuning policy.
+ */
+template <
+	int 							_RADIX_BITS,			// The number of radix bits, i.e., log2(bins)
+	int 							_MIN_CTA_OCCUPANCY,		// The minimum CTA occupancy requested for this kernel per SM
+	int 							_LOG_CTA_THREADS,		// The number of threads per CTA
+	int 							_ELEMENTS_PER_THREAD,	// The number of elements to load per thread
+	util::io::ld::CacheModifier 	_LOAD_MODIFIER,			// Load cache-modifier
+	util::io::st::CacheModifier 	_STORE_MODIFIER,		// Store cache-modifier
+	cudaSharedMemConfig				_SMEM_CONFIG,			// Shared memory bank size
+	bool 							_EARLY_EXIT>			// Whether or not to short-circuit passes if the upsweep determines homogoneous digits in the current digit place
+struct CtaUpsweepPolicy
+{
+	enum {
+		RADIX_BITS					= _RADIX_BITS,
+		MIN_CTA_OCCUPANCY  			= _MIN_CTA_OCCUPANCY,
+		LOG_CTA_THREADS				= _LOG_CTA_THREADS,
+		ELEMENTS_PER_THREAD  		= _ELEMENTS_PER_THREAD,
+		EARLY_EXIT					= _EARLY_EXIT,
+
+		CTA_THREADS					= 1 << LOG_CTA_THREADS,
+		TILE_ELEMENTS				= CTA_THREADS * ELEMENTS_PER_THREAD,
+	};
+
+	static const util::io::ld::CacheModifier 	LOAD_MODIFIER 		= _LOAD_MODIFIER;
+	static const util::io::st::CacheModifier 	STORE_MODIFIER 		= _STORE_MODIFIER;
+	static const cudaSharedMemConfig			SMEM_CONFIG			= _SMEM_CONFIG;
+};
+
 
 /**
  * Radix sort upsweep reduction CTA
  */
 template <
-	typename KernelPolicy,
+	typename CtaUpsweepPolicy,
 	typename SizeT,
 	typename KeyType>
-struct Cta
+struct CtaUpsweep
 {
 	//---------------------------------------------------------------------
 	// Type definitions and constants
@@ -55,16 +87,16 @@ struct Cta
 	typedef unsigned char DigitCounter;
 
 	// Integer type for packing DigitCounters into columns of shared memory banks
-	typedef typename util::If<(KernelPolicy::SMEM_CONFIG == cudaSharedMemBankSizeEightByte),
+	typedef typename util::If<(CtaUpsweepPolicy::SMEM_CONFIG == cudaSharedMemBankSizeEightByte),
 		unsigned long long,
 		unsigned int>::Type PackedCounter;
 
 	enum
 	{
-		RADIX_BITS					= KernelPolicy::RADIX_BITS,
+		RADIX_BITS					= CtaUpsweepPolicy::RADIX_BITS,
 		RADIX_DIGITS 				= 1 << RADIX_BITS,
 
-		LOG_CTA_THREADS 			= KernelPolicy::LOG_CTA_THREADS,
+		LOG_CTA_THREADS 			= CtaUpsweepPolicy::LOG_CTA_THREADS,
 		CTA_THREADS					= 1 << LOG_CTA_THREADS,
 
 		LOG_WARP_THREADS 			= CUB_LOG_WARP_THREADS(__CUB_CUDA_ARCH__),
@@ -73,7 +105,7 @@ struct Cta
 		LOG_WARPS					= LOG_CTA_THREADS - LOG_WARP_THREADS,
 		WARPS						= 1 << LOG_WARPS,
 
-		KEYS_PER_THREAD  			= KernelPolicy::ELEMENTS_PER_THREAD,
+		KEYS_PER_THREAD  			= CtaUpsweepPolicy::ELEMENTS_PER_THREAD,
 
 		TILE_ELEMENTS				= CTA_THREADS * KEYS_PER_THREAD,
 
@@ -148,7 +180,7 @@ struct Cta
 
 		// BucketKeys
 		static __device__ __forceinline__ void BucketKeys(
-			Cta &cta,
+			CtaUpsweep &cta,
 			UnsignedBits keys[KEYS_PER_THREAD])
 		{
 			cta.Bucket(keys[COUNT]);
@@ -158,7 +190,7 @@ struct Cta
 		}
 
 		// ProcessTiles
-		static __device__ __forceinline__ void ProcessTiles(Cta &cta, SizeT cta_offset)
+		static __device__ __forceinline__ void ProcessTiles(CtaUpsweep &cta, SizeT cta_offset)
 		{
 			// Next
 			Iterate<1, HALF>::ProcessTiles(cta, cta_offset);
@@ -171,10 +203,10 @@ struct Cta
 	struct Iterate<MAX, MAX>
 	{
 		// BucketKeys
-		static __device__ __forceinline__ void BucketKeys(Cta &cta, UnsignedBits keys[KEYS_PER_THREAD]) {}
+		static __device__ __forceinline__ void BucketKeys(CtaUpsweep &cta, UnsignedBits keys[KEYS_PER_THREAD]) {}
 
 		// ProcessTiles
-		static __device__ __forceinline__ void ProcessTiles(Cta &cta, SizeT cta_offset)
+		static __device__ __forceinline__ void ProcessTiles(CtaUpsweep &cta, SizeT cta_offset)
 		{
 			cta.ProcessFullTile(cta_offset);
 		}
@@ -188,7 +220,7 @@ struct Cta
 	/**
 	 * Constructor
 	 */
-	__device__ __forceinline__ Cta(
+	__device__ __forceinline__ CtaUpsweep(
 		SmemStorage		&smem_storage,
 		KeyType 		*d_in_keys,
 		unsigned int 	current_bit) :
@@ -361,7 +393,7 @@ struct Cta
 	/**
 	 * Process work range
 	 */
-	static __device__ __forceinline__ void ProcessWorkRange(
+	static __device__ __forceinline__ void Upsweep(
 		SmemStorage 	&smem_storage,
 		KeyType 		*d_in_keys,
 		unsigned int 	current_bit,
@@ -370,7 +402,7 @@ struct Cta
 		SizeT 			&bin_count)
 	{
 		// Construct CTA abstraction
-		Cta cta(smem_storage, d_in_keys, current_bit);
+		CtaUpsweep cta(smem_storage, d_in_keys, current_bit);
 
 		// Reset digit counters in smem and unpacked counters in registers
 		cta.ResetDigitCounters();
@@ -420,7 +452,7 @@ struct Cta
 	/**
 	 * Process work range
 	 */
-	static __device__ __forceinline__ void ProcessWorkRange(
+	static __device__ __forceinline__ void Upsweep(
 		SmemStorage 						&smem_storage,
 		SizeT 								*d_spine,
 		KeyType 							*d_in_keys,
@@ -436,7 +468,7 @@ struct Cta
 		// Sync to acquire work limits
 		__syncthreads();
 
-		// Compute bin-count for each radix digit (valid in threadId < RADIX_DIGITS)
+		// Compute bin-count for each radix digit (valid in tid < RADIX_DIGITS)
 		SizeT bin_count;
 		ProcessWorkRange(
 			smem_storage,
@@ -451,7 +483,7 @@ struct Cta
 		{
 			int spine_bin_offset = (gridDim.x * threadIdx.x) + blockIdx.x;
 
-			util::io::ModifiedStore<KernelPolicy::STORE_MODIFIER>::St(
+			util::io::ModifiedStore<CtaUpsweepPolicy::STORE_MODIFIER>::St(
 				bin_count,
 				d_spine + spine_bin_offset);
 		}
@@ -465,10 +497,10 @@ struct Cta
  * Kernel entry point
  */
 template <
-	typename KernelPolicy,
+	typename CtaUpsweepPolicy,
 	typename SizeT,
 	typename KeyType>
-__launch_bounds__ (KernelPolicy::CTA_THREADS, KernelPolicy::MIN_CTA_OCCUPANCY)
+__launch_bounds__ (CtaUpsweepPolicy::CTA_THREADS, CtaUpsweepPolicy::MIN_CTA_OCCUPANCY)
 __global__
 void Kernel(
 	SizeT 								*d_spine,
@@ -477,12 +509,12 @@ void Kernel(
 	unsigned int 						current_bit)
 {
 	// CTA abstraction type
-	typedef Cta<KernelPolicy, SizeT, KeyType> Cta;
+	typedef CtaUpsweep<CtaUpsweepPolicy, SizeT, KeyType> CtaUpsweep;
 
 	// Shared memory pool
-	__shared__ typename Cta::SmemStorage smem_storage;
+	__shared__ typename CtaUpsweep::SmemStorage smem_storage;
 
-	Cta::ProcessWorkRange(
+	CtaUpsweep::Upsweep(
 		smem_storage,
 		d_spine,
 		d_in_keys,
@@ -492,7 +524,6 @@ void Kernel(
 
 
 
-} // namespace upsweep
 } // namespace radix_sort
 } // namespace b40c
 B40C_NS_POSTFIX
