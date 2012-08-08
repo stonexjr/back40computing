@@ -18,7 +18,7 @@
  ******************************************************************************/
 
 /******************************************************************************
- * CTA-processing functionality for radix sort upsweep reduction kernels
+ * "Upsweep" CTA abstraction for computing radix digit histograms
  ******************************************************************************/
 
 #pragma once
@@ -38,7 +38,7 @@ namespace radix_sort {
 
 
 /**
- * Radix sort upsweep reduction tuning policy.
+ * Upsweep CTA tuning policy
  */
 template <
 	int 							_RADIX_BITS,			// The number of radix bits, i.e., log2(bins)
@@ -69,14 +69,16 @@ struct CtaUpsweepPolicy
 
 
 /**
- * Radix sort upsweep reduction CTA
+ * "Upsweep" CTA abstraction for computing radix digit histograms
  */
 template <
 	typename CtaUpsweepPolicy,
 	typename SizeT,
 	typename KeyType>
-struct CtaUpsweep
+class CtaUpsweep
 {
+private:
+
 	//---------------------------------------------------------------------
 	// Type definitions and constants
 	//---------------------------------------------------------------------
@@ -130,7 +132,7 @@ struct CtaUpsweep
 		UNROLLED_ELEMENTS 			= UNROLL_COUNT * TILE_ELEMENTS,
 	};
 
-
+public:
 
 	/**
 	 * Shared storage for radix distribution sorting upsweep
@@ -147,6 +149,7 @@ struct CtaUpsweep
 		};
 	};
 
+private:
 
 	//---------------------------------------------------------------------
 	// Thread fields
@@ -385,6 +388,7 @@ struct CtaUpsweep
 		}
 	}
 
+public:
 
 	//---------------------------------------------------------------------
 	// Interface
