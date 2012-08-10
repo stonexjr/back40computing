@@ -18,12 +18,11 @@
  ******************************************************************************/
 
 /******************************************************************************
- * "Upsweep" CTA abstraction for computing radix digit histograms
+ * CTA-wide "upsweep" abstraction for computing radix digit histograms
  ******************************************************************************/
 
 #pragma once
 
-#include "../../radix_sort/sort_utils.cuh"
 #include "../../util/cta_progress.cuh"
 #include "../../util/basic_utils.cuh"
 #include "../../util/device_intrinsics.cuh"
@@ -31,10 +30,17 @@
 #include "../../util/reduction/serial_reduce.cuh"
 #include "../../util/ns_umbrella.cuh"
 
+#include "../../radix_sort/sort_utils.cuh"
+
 B40C_NS_PREFIX
 namespace b40c {
 namespace radix_sort {
+namespace cta {
 
+
+//---------------------------------------------------------------------
+// Tuning policy types
+//---------------------------------------------------------------------
 
 
 /**
@@ -49,7 +55,7 @@ template <
 	util::io::st::CacheModifier 	_STORE_MODIFIER,		// Store cache-modifier
 	cudaSharedMemConfig				_SMEM_CONFIG,			// Shared memory bank size
 	bool 							_EARLY_EXIT>			// Whether or not to short-circuit passes if the upsweep determines homogoneous digits in the current digit place
-struct CtaUpsweepPolicy
+struct CtaUpsweepPassPolicy
 {
 	enum {
 		RADIX_BITS					= _RADIX_BITS,
@@ -68,14 +74,20 @@ struct CtaUpsweepPolicy
 };
 
 
+
+//---------------------------------------------------------------------
+// CTA-wide abstractions
+//---------------------------------------------------------------------
+
+
 /**
- * "Upsweep" CTA abstraction for computing radix digit histograms
+ * CTA-wide "upsweep" abstraction for computing radix digit histograms
  */
 template <
-	typename CtaUpsweepPolicy,
+	typename CtaUpsweepPassPolicy,
 	typename SizeT,
 	typename KeyType>
-class CtaUpsweep
+class CtaUpsweepPass
 {
 private:
 
@@ -89,16 +101,16 @@ private:
 	typedef unsigned char DigitCounter;
 
 	// Integer type for packing DigitCounters into columns of shared memory banks
-	typedef typename util::If<(CtaUpsweepPolicy::SMEM_CONFIG == cudaSharedMemBankSizeEightByte),
+	typedef typename util::If<(CtaUpsweepPassPolicy::SMEM_CONFIG == cudaSharedMemBankSizeEightByte),
 		unsigned long long,
 		unsigned int>::Type PackedCounter;
 
 	enum
 	{
-		RADIX_BITS					= CtaUpsweepPolicy::RADIX_BITS,
+		RADIX_BITS					= CtaUpsweepPassPolicy::RADIX_BITS,
 		RADIX_DIGITS 				= 1 << RADIX_BITS,
 
-		LOG_CTA_THREADS 			= CtaUpsweepPolicy::LOG_CTA_THREADS,
+		LOG_CTA_THREADS 			= CtaUpsweepPassPolicy::LOG_CTA_THREADS,
 		CTA_THREADS					= 1 << LOG_CTA_THREADS,
 
 		LOG_WARP_THREADS 			= CUB_LOG_WARP_THREADS(__CUB_CUDA_ARCH__),
@@ -107,7 +119,7 @@ private:
 		LOG_WARPS					= LOG_CTA_THREADS - LOG_WARP_THREADS,
 		WARPS						= 1 << LOG_WARPS,
 
-		KEYS_PER_THREAD  			= CtaUpsweepPolicy::ELEMENTS_PER_THREAD,
+		KEYS_PER_THREAD  			= CtaUpsweepPassPolicy::ELEMENTS_PER_THREAD,
 
 		TILE_ELEMENTS				= CTA_THREADS * KEYS_PER_THREAD,
 
@@ -135,12 +147,10 @@ private:
 public:
 
 	/**
-	 * Shared storage for radix distribution sorting upsweep
+	 * Shared memory storage layout
 	 */
 	struct SmemStorage
 	{
-		util::CtaProgress<SizeT, TILE_ELEMENTS> cta_progress;
-
 		union
 		{
 			DigitCounter 	digit_counters[COUNTER_LANES][CTA_THREADS][PACKING_RATIO];
@@ -152,7 +162,7 @@ public:
 private:
 
 	//---------------------------------------------------------------------
-	// Thread fields
+	// Thread fields (aggregate state bundle)
 	//---------------------------------------------------------------------
 
 	// Shared storage for this CTA
@@ -183,21 +193,21 @@ private:
 
 		// BucketKeys
 		static __device__ __forceinline__ void BucketKeys(
-			CtaUpsweep &cta,
+			CtaUpsweepPass &state_bundle,
 			UnsignedBits keys[KEYS_PER_THREAD])
 		{
-			cta.Bucket(keys[COUNT]);
+			state_bundle.Bucket(keys[COUNT]);
 
 			// Next
-			Iterate<COUNT + 1, MAX>::BucketKeys(cta, keys);
+			Iterate<COUNT + 1, MAX>::BucketKeys(state_bundle, keys);
 		}
 
 		// ProcessTiles
-		static __device__ __forceinline__ void ProcessTiles(CtaUpsweep &cta, SizeT cta_offset)
+		static __device__ __forceinline__ void ProcessTiles(CtaUpsweepPass &state_bundle, SizeT cta_offset)
 		{
 			// Next
-			Iterate<1, HALF>::ProcessTiles(cta, cta_offset);
-			Iterate<1, MAX - HALF>::ProcessTiles(cta, cta_offset + (HALF * TILE_ELEMENTS));
+			Iterate<1, HALF>::ProcessTiles(state_bundle, cta_offset);
+			Iterate<1, MAX - HALF>::ProcessTiles(state_bundle, cta_offset + (HALF * TILE_ELEMENTS));
 		}
 	};
 
@@ -206,12 +216,12 @@ private:
 	struct Iterate<MAX, MAX>
 	{
 		// BucketKeys
-		static __device__ __forceinline__ void BucketKeys(CtaUpsweep &cta, UnsignedBits keys[KEYS_PER_THREAD]) {}
+		static __device__ __forceinline__ void BucketKeys(CtaUpsweepPass &state_bundle, UnsignedBits keys[KEYS_PER_THREAD]) {}
 
 		// ProcessTiles
-		static __device__ __forceinline__ void ProcessTiles(CtaUpsweep &cta, SizeT cta_offset)
+		static __device__ __forceinline__ void ProcessTiles(CtaUpsweepPass &state_bundle, SizeT cta_offset)
 		{
-			cta.ProcessFullTile(cta_offset);
+			state_bundle.ProcessFullTile(cta_offset);
 		}
 	};
 
@@ -221,9 +231,9 @@ private:
 	//---------------------------------------------------------------------
 
 	/**
-	 * Constructor
+	 * State bundle constructor
 	 */
-	__device__ __forceinline__ CtaUpsweep(
+	__device__ __forceinline__ CtaUpsweepPass(
 		SmemStorage		&smem_storage,
 		KeyType 		*d_in_keys,
 		unsigned int 	current_bit) :
@@ -375,11 +385,11 @@ private:
 	 */
 	__device__ __forceinline__ void ProcessPartialTile(
 		SizeT cta_offset,
-		const SizeT &out_of_bounds)
+		const SizeT &num_elements)
 	{
 		// Process partial tile if necessary using single loads
 		cta_offset += threadIdx.x;
-		while (cta_offset < out_of_bounds)
+		while (cta_offset < num_elements)
 		{
 			// Load and bucket key
 			UnsignedBits key = d_in_keys[cta_offset];
@@ -395,120 +405,67 @@ public:
 	//---------------------------------------------------------------------
 
 	/**
-	 * Process work range
+	 * Perform a digit-counting "upsweep" pass
 	 */
-	static __device__ __forceinline__ void Upsweep(
+	static __device__ __forceinline__ void UpsweepPass(
 		SmemStorage 	&smem_storage,
 		KeyType 		*d_in_keys,
 		unsigned int 	current_bit,
-		SizeT 			cta_offset,
-		const SizeT 	&out_of_bounds,
-		SizeT 			&bin_count)
+		const SizeT 	&num_elements,
+		SizeT 			&bin_count)				// The digit count for tid'th bin (output param, valid in the first RADIX_DIGITS threads)
 	{
-		// Construct CTA abstraction
-		CtaUpsweep cta(smem_storage, d_in_keys, current_bit);
+		// Construct state bundle
+		CtaUpsweepPass state_bundle(smem_storage, d_in_keys, current_bit);
 
 		// Reset digit counters in smem and unpacked counters in registers
-		cta.ResetDigitCounters();
-		cta.ResetUnpackedCounters();
+		state_bundle.ResetDigitCounters();
+		state_bundle.ResetUnpackedCounters();
 
 		// Unroll batches of full tiles
-		while (cta_offset + UNROLLED_ELEMENTS <= out_of_bounds)
+		SizeT cta_offset = 0;
+		while (cta_offset + UNROLLED_ELEMENTS <= num_elements)
 		{
-			Iterate<0, UNROLL_COUNT>::ProcessTiles(cta, cta_offset);
+			Iterate<0, UNROLL_COUNT>::ProcessTiles(state_bundle, cta_offset);
 			cta_offset += UNROLLED_ELEMENTS;
 
 			__syncthreads();
 
 			// Aggregate back into local_count registers to prevent overflow
-			cta.UnpackDigitCounts();
+			state_bundle.UnpackDigitCounts();
 
 			__syncthreads();
 
 			// Reset composite counters in lanes
-			cta.ResetDigitCounters();
+			state_bundle.ResetDigitCounters();
 		}
 
 		// Unroll single full tiles
-		while (cta_offset + TILE_ELEMENTS <= out_of_bounds)
+		while (cta_offset + TILE_ELEMENTS <= num_elements)
 		{
-			cta.ProcessFullTile(cta_offset);
+			state_bundle.ProcessFullTile(cta_offset);
 			cta_offset += TILE_ELEMENTS;
 		}
 
 		// Process partial tile if necessary
-		cta.ProcessPartialTile(
+		state_bundle.ProcessPartialTile(
 			cta_offset,
-			out_of_bounds);
+			num_elements);
 
 		__syncthreads();
 
 		// Aggregate back into local_count registers
-		cta.UnpackDigitCounts();
+		state_bundle.UnpackDigitCounts();
 
 		__syncthreads();
 
 		// Final raking reduction of counts by bin, output to spine.
-		cta.ReduceUnpackedCounts(bin_count);
+		state_bundle.ReduceUnpackedCounts(bin_count);
 	}
 
 };
 
 
-
-/**
- * Kernel entry point
- */
-template <
-	typename CtaUpsweepPolicy,
-	typename SizeT,
-	typename KeyType>
-__launch_bounds__ (CtaUpsweepPolicy::CTA_THREADS, CtaUpsweepPolicy::MIN_CTA_OCCUPANCY)
-__global__
-void UpsweepKernel(
-	SizeT 								*d_spine,
-	KeyType 							*d_in_keys,
-	util::CtaWorkDistribution<SizeT> 	cta_work_distribution,
-	unsigned int 						current_bit)
-{
-	// CTA abstraction type
-	typedef CtaUpsweep<CtaUpsweepPolicy, SizeT, KeyType> CtaUpsweep;
-
-	// Shared memory pool
-	__shared__ typename CtaUpsweep::SmemStorage smem_storage;
-
-	// Determine our threadblock's work range
-	if (threadIdx.x == 0)
-	{
-		smem_storage.cta_progress.Init(cta_work_distribution);
-	}
-
-	// Sync to acquire work range
-	__syncthreads();
-
-	// Compute bin-count for each radix digit (valid in tid < RADIX_DIGITS)
-	SizeT bin_count;
-	CtaUpsweep::ProcessWorkRange(
-		smem_storage,
-		d_in_keys,
-		current_bit,
-		smem_storage.cta_progress.cta_offset,
-		smem_storage.cta_progress.out_of_bounds,
-		bin_count);
-
-	// Write out the bin_count reductions
-	if (threadIdx.x < RADIX_DIGITS)
-	{
-		int spine_bin_offset = (gridDim.x * threadIdx.x) + blockIdx.x;
-
-		util::io::ModifiedStore<CtaUpsweepPolicy::STORE_MODIFIER>::St(
-			bin_count,
-			d_spine + spine_bin_offset);
-	}
-}
-
-
-
+} // namespace cta
 } // namespace radix_sort
 } // namespace b40c
 B40C_NS_POSTFIX
