@@ -18,12 +18,14 @@
  ******************************************************************************/
 
 /******************************************************************************
- * CTA-wide "downsweep" abstraction for distributing keys
+ * CTA-wide "downsweep" abstraction for distributing keys from
+ * a range of input tiles.
  ******************************************************************************/
 
 #pragma once
 
 #include "../../util/basic_utils.cuh"
+#include "../../util/device_intrinsics.cuh"
 #include "../../util/io/modified_load.cuh"
 #include "../../util/io/modified_store.cuh"
 #include "../../util/ns_umbrella.cuh"
@@ -34,6 +36,7 @@
 B40C_NS_PREFIX
 namespace b40c {
 namespace radix_sort {
+namespace cta {
 
 
 //---------------------------------------------------------------------
@@ -66,7 +69,8 @@ template <
 	bool						 	_EARLY_EXIT>			// Whether or not to short-circuit passes if the upsweep determines homogoneous digits in the current digit place
 struct CtaDownsweepPolicy
 {
-	enum {
+	enum
+	{
 		RADIX_BITS					= _RADIX_BITS,
 		MIN_CTA_OCCUPANCY  			= _MIN_CTA_OCCUPANCY,
 		LOG_CTA_THREADS 			= _LOG_CTA_THREADS,
@@ -91,7 +95,8 @@ struct CtaDownsweepPolicy
 
 
 /**
- * CTA-wide "downsweep" abstraction for distributing keys
+ * CTA-wide "downsweep" abstraction for distributing keys from
+ * a range of input tiles.
  */
 template <
 	typename CtaDownsweepPolicy,
@@ -188,10 +193,10 @@ private:
 	SmemStorage 				&cta_smem_storage;
 
 	// Input and output device pointers
-	UnsignedBits 				*d_in_keys;
-	UnsignedBits				*d_out_keys;
-	ValueType 					*d_in_values;
-	ValueType 					*d_out_values;
+	UnsignedBits 				*d_keys_in;
+	UnsignedBits				*d_keys_out;
+	ValueType 					*d_values_in;
+	ValueType 					*d_values_out;
 
 	// The global scatter base offset for each digit (valid in the first RADIX_DIGITS threads)
 	SizeT 						bin_prefix;
@@ -334,21 +339,20 @@ private:
 	 */
 	__device__ __forceinline__ CtaDownsweep(
 		SmemStorage 	&cta_smem_storage,
-		BinDescriptor		*d_bins_out,
-		SizeT 			*d_spine,
-		KeyType 		*d_in_keys,
-		KeyType 		*d_out_keys,
-		ValueType 		*d_in_values,
-		ValueType 		*d_out_values,
+		SizeT 			bin_prefix,
+		KeyType 		*d_keys_in,
+		KeyType 		*d_keys_out,
+		ValueType 		*d_values_in,
+		ValueType 		*d_values_out,
 		unsigned int 	current_bit) :
 			cta_smem_storage(cta_smem_storage),
-			d_in_keys(reinterpret_cast<UnsignedBits*>(d_in_keys)),
-			d_out_keys(reinterpret_cast<UnsignedBits*>(d_out_keys)),
-			d_in_values(d_in_values),
-			d_out_values(d_out_values),
+			bin_prefix(bin_prefix),
+			d_keys_in(reinterpret_cast<UnsignedBits*>(d_keys_in)),
+			d_keys_out(reinterpret_cast<UnsignedBits*>(d_keys_out)),
+			d_values_in(d_values_in),
+			d_values_out(d_values_out),
 			current_bit(current_bit)
-	{
-	}
+	{}
 
 
 	/**
@@ -356,8 +360,8 @@ private:
 	 */
 	template <UnsignedBits TwiddleOp(UnsignedBits)>
 	__device__ __forceinline__ void TwiddleKeys(
-		UnsignedBits keys[KEYS_PER_THREAD],
-		UnsignedBits twiddled_keys[KEYS_PER_THREAD])		// out parameter
+		UnsignedBits 	keys[KEYS_PER_THREAD],
+		UnsignedBits 	twiddled_keys[KEYS_PER_THREAD])		// out parameter
 	{
 		#pragma unroll
 		for (int KEY = 0; KEY < KEYS_PER_THREAD; KEY++)
@@ -456,7 +460,7 @@ private:
 
 			if (FULL_TILE || (thread_offset < guarded_elements))
 			{
-				keys[KEY] = d_in_keys[cta_offset + thread_offset];
+				keys[KEY] = d_keys_in[cta_offset + thread_offset];
 			}
 		}
 
@@ -519,7 +523,7 @@ private:
 				keys,
 				ranks,
 				digit_offsets,
-				d_out_keys,
+				d_keys_out,
 				guarded_elements);
 		}
 		else if (SCATTER_STRATEGY == SCATTER_WARP_TWO_PHASE)
@@ -539,7 +543,7 @@ private:
 			Iterate<0, SCATTER_PASSES>::AlignedScatterPass(
 				cta_smem_storage,
 				cta_smem_storage.key_exchange,
-				d_out_keys,
+				d_keys_out,
 				guarded_elements);
 		}
 		else
@@ -566,7 +570,7 @@ private:
 			Iterate<0, KEYS_PER_THREAD>::template ScatterGlobal<FULL_TILE>(
 				keys,
 				digit_offsets,
-				d_out_keys,
+				d_keys_out,
 				guarded_elements);
 		}
 	}
@@ -593,7 +597,7 @@ private:
 				values,
 				ranks,
 				digit_offsets,
-				d_out_values,
+				d_values_out,
 				guarded_elements);
 		}
 		else if (SCATTER_STRATEGY == SCATTER_WARP_TWO_PHASE)
@@ -609,7 +613,7 @@ private:
 			Iterate<0, SCATTER_PASSES>::AlignedScatterPass(
 				cta_smem_storage,
 				cta_smem_storage.value_exchange,
-				d_out_values,
+				d_values_out,
 				guarded_elements);
 		}
 		else
@@ -628,7 +632,7 @@ private:
 			Iterate<0, KEYS_PER_THREAD>::template ScatterGlobal<FULL_TILE>(
 				values,
 				digit_offsets,
-				d_out_values,
+				d_values_out,
 				guarded_elements);
 		}
 	}
@@ -698,9 +702,6 @@ private:
 	}
 
 
-
-
-
 public:
 
 	//---------------------------------------------------------------------
@@ -708,46 +709,41 @@ public:
 	//---------------------------------------------------------------------
 
 	/**
-	 * Process work range of tiles
+	 * Distribute keys from a range of input tiles.
 	 */
-	static __device__ __forceinline__ void ProcessWorkRange(
-			SmemStorage 	&cta_smem_storage,
-			KeyType 		*d_in_keys,
-			KeyType 		*d_out_keys,
-			ValueType 		*d_in_values,
-			ValueType 		*d_out_values,
-			unsigned int 	current_bit)
+	static __device__ __forceinline__ void Downsweep(
+		SmemStorage 	&cta_smem_storage,
+		SizeT 			bin_prefix, 			// The global scatter base offset for each digit (valid in the first RADIX_DIGITS threads)
+		KeyType 		*d_keys_in,
+		KeyType 		*d_keys_out,
+		ValueType 		*d_values_in,
+		ValueType 		*d_values_out,
+		unsigned int 	current_bit,
+		const SizeT 	&num_elements)			// Number of elements for this CTA to process
 	{
-		// Construct CTA abstraction
+		// Construct state bundle
 		CtaUpsweep cta(
 			cta_smem_storage,
-			d_in_keys,
+			bin_prefix,
+			d_keys_in,
+			d_keys_out,
+			d_values_in,
+			d_values_out,
 			current_bit);
 
-		if (threadIdx.x == 0)
-		{
-			// Determine our threadblock's work range
-			cta_smem_storage.cta_progress.Init(cta_work_distribution);
-		}
-
-		// Sync to acquire work limits
-		__syncthreads();
-
-		// Make sure we get a local copy of the cta's offset (work_limits may be in smem)
-		SizeT cta_offset = cta_smem_storage.cta_progress.cta_offset;
-
 		// Process full tiles of tile_elements
-		while (cta_offset + TILE_ELEMENTS <= cta_smem_storage.cta_progress.out_of_bounds)
+		SizeT cta_offset = 0;
+		while (cta_offset + TILE_ELEMENTS <= num_elements)
 		{
-			ProcessTile<true>(cta_offset);
+			cta.ProcessTile<true>(cta_offset);
 			cta_offset += TILE_ELEMENTS;
 		}
 
-		// Clean up last partial tile with guarded-io
-		if (cta_offset < cta_smem_storage.cta_progress.out_of_bounds)
+		// Clean up last partial tile with guarded-I/O
+		if (cta_offset < num_elements)
 		{
-			SizeT remainder = cta_smem_storage.cta_progress.out_of_bounds - cta_offset;
-			ProcessTile<false>(cta_offset, remainder);
+			SizeT remainder = num_elements - cta_offset;
+			cta.ProcessTile<false>(cta_offset, remainder);
 		}
 	}
 };
@@ -758,6 +754,7 @@ public:
 
 
 
+} // namespace cta
 } // namespace radix_sort
 } // namespace b40c
 B40C_NS_POSTFIX
