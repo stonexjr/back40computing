@@ -166,7 +166,7 @@ private:
 	//---------------------------------------------------------------------
 
 	// Shared storage for this CTA
-	SmemStorage 		&smem_storage;
+	SmemStorage 		&cta_smem_storage;
 
 	// Thread-local counters for periodically aggregating composite-counter lanes
 	SizeT 				local_counts[LANES_PER_WARP][PACKING_RATIO];
@@ -234,10 +234,10 @@ private:
 	 * State bundle constructor
 	 */
 	__device__ __forceinline__ CtaUpsweepPass(
-		SmemStorage		&smem_storage,
+		SmemStorage		&cta_smem_storage,
 		KeyType 		*d_in_keys,
 		unsigned int 	current_bit) :
-			smem_storage(smem_storage),
+			cta_smem_storage(cta_smem_storage),
 			d_in_keys(reinterpret_cast<UnsignedBits*>(d_in_keys)),
 			current_bit(current_bit)
 	{}
@@ -258,7 +258,7 @@ private:
 		UnsignedBits row_offset = util::BFE(converted_key, current_bit + LOG_PACKING_RATIO, LOG_COUNTER_LANES);
 
 		// Increment counter
-		smem_storage.digit_counters[row_offset][threadIdx.x][sub_counter]++;
+		cta_smem_storage.digit_counters[row_offset][threadIdx.x][sub_counter]++;
 
 	}
 
@@ -271,7 +271,7 @@ private:
 		#pragma unroll
 		for (int LANE = 0; LANE < COUNTER_LANES; LANE++)
 		{
-			smem_storage.packed_counters[LANE][threadIdx.x] = 0;
+			cta_smem_storage.packed_counters[LANE][threadIdx.x] = 0;
 		}
 	}
 
@@ -316,7 +316,7 @@ private:
 					for (int UNPACKED_COUNTER = 0; UNPACKED_COUNTER < PACKING_RATIO; UNPACKED_COUNTER++)
 					{
 						const int OFFSET = (((COUNTER_LANE * CTA_THREADS) + PACKED_COUNTER) * PACKING_RATIO) + UNPACKED_COUNTER;
-						local_counts[LANE][UNPACKED_COUNTER] += smem_storage.digit_counters[warp_id][warp_tid][OFFSET];
+						local_counts[LANE][UNPACKED_COUNTER] += cta_smem_storage.digit_counters[warp_id][warp_tid][OFFSET];
 					}
 				}
 			}
@@ -344,7 +344,7 @@ private:
 				#pragma unroll
 				for (int UNPACKED_COUNTER = 0; UNPACKED_COUNTER < PACKING_RATIO; UNPACKED_COUNTER++)
 				{
-					smem_storage.digit_partials[digit_row + UNPACKED_COUNTER][warp_tid]
+					cta_smem_storage.digit_partials[digit_row + UNPACKED_COUNTER][warp_tid]
 						  = local_counts[LANE][UNPACKED_COUNTER];
 				}
 			}
@@ -356,7 +356,7 @@ private:
 		if (threadIdx.x < RADIX_DIGITS)
 		{
 			bin_count = util::reduction::SerialReduce<WARP_THREADS>::Invoke(
-				smem_storage.digit_partials[threadIdx.x]);
+				cta_smem_storage.digit_partials[threadIdx.x]);
 		}
 	}
 
@@ -408,14 +408,14 @@ public:
 	 * Perform a digit-counting "upsweep" pass
 	 */
 	static __device__ __forceinline__ void UpsweepPass(
-		SmemStorage 	&smem_storage,
+		SmemStorage 	&cta_smem_storage,
 		KeyType 		*d_in_keys,
 		unsigned int 	current_bit,
 		const SizeT 	&num_elements,
 		SizeT 			&bin_count)				// The digit count for tid'th bin (output param, valid in the first RADIX_DIGITS threads)
 	{
 		// Construct state bundle
-		CtaUpsweepPass state_bundle(smem_storage, d_in_keys, current_bit);
+		CtaUpsweepPass state_bundle(cta_smem_storage, d_in_keys, current_bit);
 
 		// Reset digit counters in smem and unpacked counters in registers
 		state_bundle.ResetDigitCounters();
